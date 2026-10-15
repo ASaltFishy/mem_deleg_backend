@@ -22,5 +22,7 @@ static_assert(PR_MEMORY_DELEGATION_F_RESET_ARENA == (1UL << 0),
               "reset flag drift");
 static_assert(PR_MEMORY_DELEGATION_F_DRAIN_LOG == (1UL << 1),
               "drain flag drift");
+static_assert(PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND == (1UL << 2),
+              "external-backend flag drift");
 
 int main() { return 0; }

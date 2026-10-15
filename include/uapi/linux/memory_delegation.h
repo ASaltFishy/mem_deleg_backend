@@ -43,7 +43,7 @@ struct md_log_ring {
 	__u32 head;
 	__u32 tail;
 	__u32 dropped;
-	__u32 reserved;
+	__u32 last_error;	/* positive errno from the last rejected record */
 	struct md_shadow_log entries[];
 };
 

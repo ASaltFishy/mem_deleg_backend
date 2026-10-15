@@ -30,8 +30,9 @@ enum md_kernel_log_operation {
 
 enum { MD_KERNEL_LOG_PREFAULT = 1U << 0 };
 
-// Opens one per-(mm, arena CPU) ownership-log channel. In OPTIONAL mode an
-// unsupported kernel succeeds with *out == NULL; REQUIRED mode returns ENOTSUP.
+// Opens one per-(mm, arena CPU) ownership-log channel using the external
+// backend ABI. In OPTIONAL mode an unsupported kernel succeeds with
+// *out == NULL; REQUIRED mode returns ENOTSUP.
 int md_kernel_bridge_open(md_kernel_bridge **out,
                           const md_kernel_bridge_config *config);
 

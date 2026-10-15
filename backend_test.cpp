@@ -24,6 +24,13 @@ int main() {
          Layout.nr_pages == Config.capacity / 4096);
   assert(md_get_arena_layout(Backend, md_arena_count(Backend), &Layout) ==
          EINVAL);
+  if (md_arena_count(Backend) > 1) {
+    md_arena_layout Next{};
+    assert(md_get_arena_layout(Backend, 1, &Next) == 0);
+    assert(Next.data_base == Layout.data_base + Config.capacity + 4096);
+    assert(!md_contains(Backend, Layout.data_base + Config.capacity));
+    assert(md_contains(Backend, Next.data_base));
+  }
   md_lease First{};
   assert(md_acquire(Backend, 256 << 10, 4096, 1001, &First) == 0);
   std::memset(reinterpret_cast<void *>(First.address), 0x5a, First.size);

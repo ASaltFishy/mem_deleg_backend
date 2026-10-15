@@ -13,7 +13,8 @@ typedef struct md_backend md_backend;
 typedef struct {
   const char *domain;
   uintptr_t fixed_address;
-  // Capacity per CPU arena; the virtual window is capacity * arena_count.
+  // Capacity per CPU arena. Arenas have one unmapped guard page between them
+  // so the kernel can attach an independent ownership VMA to each arena.
   size_t capacity;
   int reset;
 } md_config;

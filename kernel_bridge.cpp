@@ -32,7 +32,7 @@ struct KernelLogRing {
   uint32_t Head;
   uint32_t Tail;
   uint32_t Dropped;
-  uint32_t Reserved;
+  uint32_t LastError;
   KernelLogEntry Entries[];
 };
 
@@ -102,18 +102,13 @@ extern "C" int md_kernel_bridge_open(
   Ring->ArenaNrPages = Config->arena_nr_pages;
   Ring->RingSize = static_cast<uint32_t>(RingSize);
 
-  const unsigned long RegisterFlags = Config->reset_arena
-      ? PR_MEMORY_DELEGATION_F_RESET_ARENA : 0UL;
+  const unsigned long RegisterFlags =
+      PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND |
+      (Config->reset_arena ? PR_MEMORY_DELEGATION_F_RESET_ARENA : 0UL);
   long Result = prctl(PR_SET_MEMORY_DELEGATION_LOG,
                       reinterpret_cast<unsigned long>(Ring), RegisterFlags,
                       static_cast<unsigned long>(Config->arena_cpu),
                       static_cast<unsigned long>(Config->arena_data_base));
-  if (Result != 0 && Config->reset_arena && unsupportedPrctlError(errno)) {
-    Result = prctl(PR_SET_MEMORY_DELEGATION_LOG,
-                   reinterpret_cast<unsigned long>(Ring), 0UL,
-                   static_cast<unsigned long>(Config->arena_cpu),
-                   static_cast<unsigned long>(Config->arena_data_base));
-  }
   if (Result != 0) {
     const int Error = errno;
     munmap(Memory, RingSize);
@@ -142,7 +137,10 @@ extern "C" int md_kernel_bridge_drain(md_kernel_bridge *Bridge) {
       PR_MEMORY_DELEGATION_F_DRAIN_LOG,
       static_cast<unsigned long>(Bridge->ArenaCpu),
       static_cast<unsigned long>(Bridge->ArenaDataBase));
-  return Result < 0 ? errno : 0;
+  if (Result < 0)
+    return errno;
+  return static_cast<int>(
+      __atomic_exchange_n(&Bridge->Ring->LastError, 0U, __ATOMIC_ACQ_REL));
 }
 
 extern "C" int md_kernel_bridge_transition(
@@ -175,6 +173,7 @@ extern "C" int md_kernel_bridge_transition(
   Entry.Flags = static_cast<uint16_t>(Flags);
   Entry.StartPage = StartPage;
   Entry.NumPages = NumPages;
+  __atomic_store_n(&Ring->LastError, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&Ring->Tail, Tail + 1, __ATOMIC_RELEASE);
   return md_kernel_bridge_drain(Bridge);
 }

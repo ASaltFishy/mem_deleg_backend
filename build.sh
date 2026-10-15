@@ -12,7 +12,7 @@ compile_test() {
   local source="$2"
   shift 2
   "$cxx" "${common[@]}" "$@" \
-    "$root/delegation_backend.cpp" "$root/$source" \
+    "$root/delegation_backend.cpp" "$root/kernel_bridge.cpp" "$root/$source" \
     -o "$build/$output"
 }
 
@@ -39,6 +39,8 @@ if [[ -n "${KERNEL_TREE:-}" ]]; then
   grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_RESET_ARENA[[:space:]]+\(1UL << 0\)$' \
     "$KERNEL_TREE/include/uapi/linux/prctl.h"
   grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_DRAIN_LOG[[:space:]]+\(1UL << 1\)$' \
+    "$KERNEL_TREE/include/uapi/linux/prctl.h"
+  grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND[[:space:]]+\(1UL << 2\)$' \
     "$KERNEL_TREE/include/uapi/linux/prctl.h"
   "$cxx" "${common[@]}" "$root/kernel_abi_test.cpp" \
     -o "$build/kernel_abi_test"
