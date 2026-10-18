@@ -63,3 +63,30 @@ handoff ordering is a separate performance change and is not assumed here.
 - asynchronous batching policy for normal ownership transitions;
 - unregister ABI for closing and reopening a backend in the same `mm`;
 - Android broker distribution and protocol version negotiation.
+
+## Device validation
+
+Validated on 2026-10-18 on a PLK110/OP60FFL1 test device using
+`fastboot boot`, without writing any boot or DLKM partition. The active-kernel
+test covers:
+
+- normal external-backend ALLOC and FREE transitions;
+- propagation of a rejected ALLOC as `EBUSY` to userspace;
+- quarantine of a page still owned when its process exits;
+- denial of a fault against the quarantined page;
+- continued allocation and release of an unrelated page.
+
+The test passed once interactively and then passed 100 consecutive stress
+iterations. No memory-delegation-related warning, oops, panic or use-after-free
+was observed. A pre-test SLUB warning came from the vendor
+`oplus_bsp_schedinfo` tick hook, outside the memory-delegation path.
+
+The temporary kernel still exhibits the repository's previously documented
+new-kernel/old-DLKM Wi-Fi symbol mismatch. No DLKM partition was changed for
+this test. A normal reboot changed the boot ID, preserved slot `_a`, left the
+`boot_a` SHA-256 unchanged, and the external-backend ABI probe returned to the
+unsupported-kernel fallback, confirming rollback to the persistent kernel.
+
+`kernel_external_backend_test.cpp` is the standalone static-friendly test used
+on the device. It deliberately requires the aligned ABI and is compiled but
+not run by the host smoke-test script.
