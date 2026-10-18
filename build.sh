@@ -33,6 +33,8 @@ compile_test structure_bench structure_bench.cpp
 "$cxx" "${common[@]}" "$root/kernel_bridge.cpp" \
   "$root/kernel_external_backend_test.cpp" \
   -o "$build/kernel_external_backend_test"
+"$cxx" "${common[@]}" "$root/kernel_context_switch_test.cpp" \
+  -o "$build/kernel_context_switch_test"
 
 if [[ -n "${KERNEL_TREE:-}" ]]; then
   cmp "$root/include/uapi/linux/memory_delegation.h" \

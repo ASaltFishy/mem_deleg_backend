@@ -81,6 +81,18 @@ iterations. No memory-delegation-related warning, oops, panic or use-after-free
 was observed. A pre-test SLUB warning came from the vendor
 `oplus_bsp_schedinfo` tick hook, outside the memory-delegation path.
 
+A separate same-CPU context-switch test uses two simultaneously live processes.
+Both processes prefault the same two free pages to establish stale PTEs, append
+ownership records without issuing an explicit DRAIN request, and then block on
+pipes to force scheduler switches. It verified in both ownership directions
+that switch-out drains the pending ALLOC, revokes the non-owner's stale PTE,
+denies the non-owner fault, and preserves the owner's access. It also verified
+that an asynchronously drained FREE makes the page faultable by the other
+process again. The test passed once interactively and then passed 100
+consecutive iterations. The denial diagnostics named two distinct live `mm`s
+and the corresponding distinct owners; no memory-delegation error, oops, or
+panic was emitted during the run.
+
 The temporary kernel still exhibits the repository's previously documented
 new-kernel/old-DLKM Wi-Fi symbol mismatch. No DLKM partition was changed for
 this test. A normal reboot changed the boot ID, preserved slot `_a`, left the
@@ -89,4 +101,6 @@ unsupported-kernel fallback, confirming rollback to the persistent kernel.
 
 `kernel_external_backend_test.cpp` is the standalone static-friendly test used
 on the device. It deliberately requires the aligned ABI and is compiled but
-not run by the host smoke-test script.
+not run by the host smoke-test script. `kernel_context_switch_test.cpp` is the
+standalone same-CPU asynchronous-drain and live-process isolation test; it is
+also compiled but not run by the host smoke-test script.
