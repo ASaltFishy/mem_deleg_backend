@@ -93,6 +93,17 @@ consecutive iterations. The denial diagnostics named two distinct live `mm`s
 and the corresponding distinct owners; no memory-delegation error, oops, or
 panic was emitted during the run.
 
+An additional unrelated-process test starts two sibling workers through
+separate `exec` calls, so neither worker is the other's parent and neither
+inherits the other's address space or delegation context. A coordinator passes
+the same memfd backing object to each worker independently using `SCM_RIGHTS`;
+each worker maps it at the shared arena address and registers its own ring. The
+same-CPU test verified asynchronous switch-out drain, stale-PTE revocation,
+same-process owner access, bidirectional non-owner denial, and post-FREE
+refault. It passed once interactively and then passed 100 consecutive
+iterations. Kernel diagnostics show each direction using distinct worker PIDs
+and `mm`s, with the peer `mm` recorded as owner.
+
 The temporary kernel still exhibits the repository's previously documented
 new-kernel/old-DLKM Wi-Fi symbol mismatch. No DLKM partition was changed for
 this test. A normal reboot changed the boot ID, preserved slot `_a`, left the
@@ -104,3 +115,5 @@ on the device. It deliberately requires the aligned ABI and is compiled but
 not run by the host smoke-test script. `kernel_context_switch_test.cpp` is the
 standalone same-CPU asynchronous-drain and live-process isolation test; it is
 also compiled but not run by the host smoke-test script.
+`kernel_unrelated_process_test.cpp` is the independently exec'd, shared-fd
+cross-process isolation test and follows the same compile-only host policy.
