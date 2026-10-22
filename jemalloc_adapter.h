@@ -9,6 +9,7 @@ extern "C" {
 
 int md_jemalloc_init(const char *domain, unsigned *arena);
 void md_jemalloc_stats(md_stats *stats);
+int md_jemalloc_checkpoint(void);
 
 #ifdef __cplusplus
 }

@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
+#include <sched.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -59,6 +61,9 @@ struct md_kernel_bridge {
   uintptr_t ArenaDataBase;
   uint32_t ArenaCpu;
   uint32_t ArenaNrPages;
+  uint32_t Channel;
+  pid_t Pid;
+  pthread_mutex_t ProducerLock;
 };
 
 extern "C" int md_kernel_bridge_open(
@@ -79,8 +84,14 @@ extern "C" int md_kernel_bridge_open(
   if (Storage == MAP_FAILED)
     return errno;
   const size_t RingSize = static_cast<size_t>(RuntimePageSize);
-  void *Memory = mmap(nullptr, RingSize, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *Memory = Config->ring_memory;
+  if (Memory && reinterpret_cast<uintptr_t>(Memory) % RingSize) {
+    munmap(Storage, sizeof(md_kernel_bridge));
+    return EINVAL;
+  }
+  if (!Memory)
+    Memory = mmap(nullptr, RingSize, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (Memory == MAP_FAILED) {
     munmap(Storage, sizeof(md_kernel_bridge));
     return errno;
@@ -92,7 +103,7 @@ extern "C" int md_kernel_bridge_open(
   const uint32_t RawCapacity = static_cast<uint32_t>(
       (RingSize - HeaderSize) / sizeof(KernelLogEntry));
   if (!RawCapacity) {
-    munmap(Memory, RingSize);
+    if (!Config->ring_memory) munmap(Memory, RingSize);
     munmap(Storage, sizeof(md_kernel_bridge));
     return ENOSPC;
   }
@@ -104,6 +115,7 @@ extern "C" int md_kernel_bridge_open(
 
   const unsigned long RegisterFlags =
       PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND |
+      PR_MEMORY_DELEGATION_F_ASYNC_EXTERNAL |
       (Config->reset_arena ? PR_MEMORY_DELEGATION_F_RESET_ARENA : 0UL);
   long Result = prctl(PR_SET_MEMORY_DELEGATION_LOG,
                       reinterpret_cast<unsigned long>(Ring), RegisterFlags,
@@ -111,7 +123,7 @@ extern "C" int md_kernel_bridge_open(
                       static_cast<unsigned long>(Config->arena_data_base));
   if (Result != 0) {
     const int Error = errno;
-    munmap(Memory, RingSize);
+    if (!Config->ring_memory) munmap(Memory, RingSize);
     munmap(Storage, sizeof(md_kernel_bridge));
     if (Config->mode == MD_KERNEL_BRIDGE_OPTIONAL &&
         unsupportedPrctlError(Error))
@@ -125,13 +137,19 @@ extern "C" int md_kernel_bridge_open(
   Bridge->ArenaDataBase = Config->arena_data_base;
   Bridge->ArenaCpu = Config->arena_cpu;
   Bridge->ArenaNrPages = Config->arena_nr_pages;
+  Bridge->Channel = Config->channel_id;
+  Bridge->Pid = getpid();
+  // Registration has succeeded; retain its pinned mapping for the mm lifetime.
+  int LockError = pthread_mutex_init(&Bridge->ProducerLock, nullptr);
+  if (LockError) {
+    munmap(Storage, sizeof(md_kernel_bridge));
+    return LockError;
+  }
   *Out = Bridge;
   return 0;
 }
 
-extern "C" int md_kernel_bridge_drain(md_kernel_bridge *Bridge) {
-  if (!Bridge)
-    return EINVAL;
+static int drainLocked(md_kernel_bridge *Bridge) {
   const long Result = prctl(
       PR_SET_MEMORY_DELEGATION_LOG, 0UL,
       PR_MEMORY_DELEGATION_F_DRAIN_LOG,
@@ -140,12 +158,38 @@ extern "C" int md_kernel_bridge_drain(md_kernel_bridge *Bridge) {
   if (Result < 0)
     return errno;
   return static_cast<int>(
-      __atomic_exchange_n(&Bridge->Ring->LastError, 0U, __ATOMIC_ACQ_REL));
+      __atomic_load_n(&Bridge->Ring->LastError, __ATOMIC_ACQUIRE));
 }
 
-extern "C" int md_kernel_bridge_transition(
+// An mm can have several allocator threads and cross-CPU FREE producers.
+// Serialize publication; release Tail only after the entire entry is written.
+namespace {
+struct ProducerGuard {
+  pthread_mutex_t *Mutex;
+  explicit ProducerGuard(pthread_mutex_t *M) : Mutex(M) {
+    pthread_mutex_lock(Mutex);
+  }
+  ~ProducerGuard() { pthread_mutex_unlock(Mutex); }
+};
+} // namespace
+
+extern "C" int md_kernel_bridge_drain(md_kernel_bridge *Bridge) {
+  if (!Bridge)
+    return EINVAL;
+  ProducerGuard Guard(&Bridge->ProducerLock);
+  return drainLocked(Bridge);
+}
+
+extern "C" uint32_t md_kernel_bridge_pending(md_kernel_bridge *Bridge) {
+  if (!Bridge) return 0;
+  ProducerGuard Guard(&Bridge->ProducerLock);
+  uint32_t Head = __atomic_load_n(&Bridge->Ring->Head, __ATOMIC_ACQUIRE);
+  return __atomic_load_n(&Bridge->Ring->Tail, __ATOMIC_ACQUIRE) - Head;
+}
+
+extern "C" int md_kernel_bridge_enqueue(
     md_kernel_bridge *Bridge, unsigned Operation, uint32_t StartPage,
-    uint32_t NumPages, unsigned Flags) {
+    uint32_t NumPages, unsigned Flags, uint32_t *Ticket) {
   if (!Bridge || (Operation != MD_KERNEL_LOG_ALLOC &&
                   Operation != MD_KERNEL_LOG_FREE) ||
       !NumPages || StartPage >= Bridge->ArenaNrPages ||
@@ -153,11 +197,23 @@ extern "C" int md_kernel_bridge_transition(
       (Flags & ~static_cast<unsigned>(MD_KERNEL_LOG_PREFAULT)))
     return EINVAL;
 
+  ProducerGuard Guard(&Bridge->ProducerLock);
   KernelLogRing *Ring = Bridge->Ring;
+  // Scheduler-consumed errors are sticky: never erase one on a new append.
+  int PendingError = static_cast<int>(
+      __atomic_load_n(&Ring->LastError, __ATOMIC_ACQUIRE));
+  if (PendingError)
+    return PendingError;
   uint32_t Head = __atomic_load_n(&Ring->Head, __ATOMIC_ACQUIRE);
   uint32_t Tail = __atomic_load_n(&Ring->Tail, __ATOMIC_RELAXED);
   if (Tail - Head >= Ring->Capacity) {
-    int Error = md_kernel_bridge_drain(Bridge);
+    // Match Scudo: let switch-out consume the batch before forcing a drain.
+    sched_yield();
+    Head = __atomic_load_n(&Ring->Head, __ATOMIC_ACQUIRE);
+    int Error = static_cast<int>(
+        __atomic_load_n(&Ring->LastError, __ATOMIC_ACQUIRE));
+    if (!Error && Tail - Head >= Ring->Capacity)
+      Error = drainLocked(Bridge);
     if (Error)
       return Error;
     Head = __atomic_load_n(&Ring->Head, __ATOMIC_ACQUIRE);
@@ -173,17 +229,34 @@ extern "C" int md_kernel_bridge_transition(
   Entry.Flags = static_cast<uint16_t>(Flags);
   Entry.StartPage = StartPage;
   Entry.NumPages = NumPages;
-  __atomic_store_n(&Ring->LastError, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&Ring->Tail, Tail + 1, __ATOMIC_RELEASE);
-  return md_kernel_bridge_drain(Bridge);
+  if (Ticket)
+    *Ticket = Tail + 1;
+  return 0;
+}
+
+extern "C" int md_kernel_bridge_transition(
+    md_kernel_bridge *Bridge, unsigned Operation, uint32_t StartPage,
+    uint32_t NumPages, unsigned Flags) {
+  return md_kernel_bridge_enqueue(Bridge, Operation, StartPage, NumPages,
+                                  Flags, nullptr);
+}
+
+extern "C" uint32_t md_kernel_bridge_channel(const md_kernel_bridge *Bridge) {
+  return Bridge->Channel;
 }
 
 extern "C" void md_kernel_bridge_close(md_kernel_bridge *Bridge) {
   if (!Bridge)
     return;
-  // There is currently no unregister prctl. Drain and intentionally leave the
-  // pinned ring mapping alive until process exit; unmapping could let the VA be
-  // reused while the kernel still owns a reference to the page.
-  (void)md_kernel_bridge_drain(Bridge);
+  // No unregister prctl exists. Drain before close. Private ring mappings stay
+  // alive until exit; shared ring storage belongs to the backend and its slot
+  // must not be recycled while kernel or Pending descriptors may reference it.
+  // After fork, only the parent owns this inherited channel. The child must
+  // neither drain it using its own mm nor lock a mutex inherited while held.
+  if (Bridge->Pid == getpid()) {
+    (void)md_kernel_bridge_drain(Bridge);
+    pthread_mutex_destroy(&Bridge->ProducerLock);
+  }
   munmap(Bridge, sizeof(*Bridge));
 }

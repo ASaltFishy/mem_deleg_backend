@@ -10,6 +10,9 @@ extern "C" {
 
 typedef struct md_backend md_backend;
 
+// Payload capacity per CPU arena; metadata and guard pages are separate.
+#define MD_DEFAULT_ARENA_CAPACITY (512ULL << 20)
+
 typedef struct {
   const char *domain;
   uintptr_t fixed_address;
@@ -71,6 +74,10 @@ int md_drain_remote(md_backend *backend, unsigned arena);
 
 int md_backend_open(md_backend **out, const md_config *config);
 void md_backend_close(md_backend *backend);
+// Administrative checkpoint: callers must pause allocator producers in this mm.
+// Drain all registered mm rings and reap completed FREEs without purging caches
+// or resetting arena truth. Never call from the measured allocation fast path.
+int md_backend_checkpoint(md_backend *backend);
 uint32_t md_process_id(void);
 
 int md_acquire(md_backend *backend, size_t size, size_t alignment,
@@ -83,7 +90,8 @@ int md_try_acquire(md_backend *backend, md_candidate candidate,
                    uint32_t owner, md_lease *out);
 int md_release(md_backend *backend, const md_lease *lease, int clear_payload,
                md_candidate *out_candidate);
-// Remote release queues publication and returns {UINT32_MAX, 0} as candidate.
+// Kernel-enabled or remote release queues publication and returns an invalid
+// {UINT32_MAX, 0} candidate. Reuse waits for kernel completion when enabled.
 // md_get_stats drains mailboxes; it is an administrative, not hot-path API.
 int md_release_address(md_backend *backend, uintptr_t address, size_t size,
                        uint32_t owner, int clear_payload);

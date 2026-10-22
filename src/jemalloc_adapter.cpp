@@ -8,10 +8,17 @@
 
 static md_backend *Backend;
 static md_lease *LeaseByPage;
+static size_t PageSize;
 static extent_hooks_t Hooks;
 static extent_hooks_t *DefaultHooks;
 static thread_local bool PayloadRequest;
 extern "C" void md_jemalloc_request(int Enabled) { PayloadRequest = Enabled; }
+
+#if defined(__ANDROID__)
+static constexpr uintptr_t kDelegationBase = 0x2000000000ULL;
+#else
+static constexpr uintptr_t kDelegationBase = 0x280000000000ULL;
+#endif
 
 extern "C" int md_jemalloc_owns(void *Address) {
   return Backend && md_contains(Backend, reinterpret_cast<uintptr_t>(Address));
@@ -27,7 +34,7 @@ static void *allocate(extent_hooks_t *, void *NewAddress, size_t Size,
   md_lease Lease{};
   if (md_acquire_flags(Backend, Size, Alignment, md_process_id(),
                        *Zero ? MD_ZERO : 0, &Lease)) return nullptr;
-  LeaseByPage[(Lease.address - 0x280000000000ULL) / 4096] = Lease;
+  LeaseByPage[(Lease.address - kDelegationBase) / PageSize] = Lease;
   *Commit = true;
   return reinterpret_cast<void *>(Lease.address);
 }
@@ -36,7 +43,7 @@ static bool deallocate(extent_hooks_t *, void *Address, size_t Size,
                         bool Committed, unsigned Arena) {
   if (!md_jemalloc_owns(Address))
     return DefaultHooks->dalloc(DefaultHooks, Address, Size, Committed, Arena);
-  size_t Page = (reinterpret_cast<uintptr_t>(Address) - 0x280000000000ULL) / 4096;
+  size_t Page = (reinterpret_cast<uintptr_t>(Address) - kDelegationBase) / PageSize;
   md_lease Lease = LeaseByPage[Page];
   // Exclusive extent ownership protects this entry. Clear before publication.
   LeaseByPage[Page] = {};
@@ -92,10 +99,15 @@ extern "C" int md_jemalloc_init(const char *Domain, unsigned *Arena) {
   int Result = je_mallctl("arena.0.extent_hooks", &DefaultHooks, &HookSize,
                           nullptr, 0);
   if (Result) return Result;
-  md_config Config{Domain, 0x280000000000ULL, 128ULL << 20, 0};
+  PageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  md_config Config{Domain, kDelegationBase, MD_DEFAULT_ARENA_CAPACITY, 0};
   Result = md_backend_open(&Backend, &Config);
   if (Result) return Result;
-  size_t Entries = size_t(32768) * md_arena_count(Backend);
+  // Derive the lookup window from the backend layout, including guard holes.
+  md_arena_layout Last{};
+  Result = md_get_arena_layout(Backend, md_arena_count(Backend) - 1, &Last);
+  if (Result) return Result;
+  size_t Entries = (Last.data_base - kDelegationBase) / PageSize + Last.nr_pages;
   LeaseByPage = static_cast<md_lease *>(mmap(nullptr, Entries * sizeof(md_lease),
       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
   if (LeaseByPage == MAP_FAILED) return ENOMEM;
@@ -106,3 +118,7 @@ extern "C" int md_jemalloc_init(const char *Domain, unsigned *Arena) {
   return je_mallctl("arenas.create", Arena, &Size, &Pointer, sizeof(Pointer));
 }
 extern "C" void md_jemalloc_stats(md_stats *Stats) { md_get_stats(Backend, Stats); }
+
+extern "C" int md_jemalloc_checkpoint() {
+  return Backend ? md_backend_checkpoint(Backend) : ENODEV;
+}

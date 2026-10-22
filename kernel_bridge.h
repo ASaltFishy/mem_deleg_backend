@@ -21,6 +21,8 @@ typedef struct {
   uint32_t arena_nr_pages;
   int reset_arena;
   int mode;
+  void *ring_memory; // Optional shared, page-aligned storage, retained by caller.
+  uint32_t channel_id;
 } md_kernel_bridge_config;
 
 enum md_kernel_log_operation {
@@ -36,13 +38,20 @@ enum { MD_KERNEL_LOG_PREFAULT = 1U << 0 };
 int md_kernel_bridge_open(md_kernel_bridge **out,
                           const md_kernel_bridge_config *config);
 
-// Appends one ownership transition and synchronously drains it into the kernel
-// truth layer. Returning zero means the kernel consumed the transition.
+// Appends only: successful return means enqueued, not kernel-acknowledged.
+// FREE must remain Pending until the shared ring's head passes its ticket.
+// Ring-full backpressure yields then drains only if still full; errors stick.
+int md_kernel_bridge_enqueue(md_kernel_bridge *bridge, unsigned operation,
+                            uint32_t start_page, uint32_t nr_pages,
+                            unsigned flags, uint32_t *ticket);
+uint32_t md_kernel_bridge_channel(const md_kernel_bridge *bridge);
+
 int md_kernel_bridge_transition(md_kernel_bridge *bridge, unsigned operation,
                                 uint32_t start_page, uint32_t nr_pages,
                                 unsigned flags);
 
 int md_kernel_bridge_drain(md_kernel_bridge *bridge);
+uint32_t md_kernel_bridge_pending(md_kernel_bridge *bridge);
 void md_kernel_bridge_close(md_kernel_bridge *bridge);
 
 #ifdef __cplusplus

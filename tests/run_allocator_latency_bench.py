@@ -13,6 +13,11 @@ import re
 import shlex
 import subprocess
 import sys
+import time
+import uuid
+import fcntl
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,14 +56,14 @@ def split_csv(value, cast=str):
     return [cast(item.strip()) for item in value.split(",") if item.strip()]
 
 
-def run(command, *, capture=False, check=True):
-    return subprocess.run(command, text=True, capture_output=capture, check=check)
+def run(command, *, capture=False, check=True, timeout=None):
+    return subprocess.run(command, text=True, capture_output=capture, check=check, timeout=timeout)
 
 
-def remote_shell(host, command, *, capture=False):
+def remote_shell(host, command, *, capture=False, check=True, timeout=None):
     if host:
-        return run([*SSH_ARGS, host, f"bash -lc {shlex.quote(command)}"], capture=capture)
-    return run(["bash", "-lc", command], capture=capture)
+        return run([*SSH_ARGS, host, f"bash -lc {shlex.quote(command)}"], capture=capture, check=check, timeout=timeout)
+    return run(["bash", "-lc", command], capture=capture, check=check, timeout=timeout)
 
 
 def adb_command(args, fragment, *, capture=False):
@@ -112,6 +117,8 @@ def detect_physical_cpus(args):
 
 def deploy(args, binaries):
     adb_command(args, f"mkdir -p {shlex.quote(args.device_dir)}")
+    if args.device_shm_dir:
+        adb_command(args, f"su -c {shlex.quote(f'mkdir -p {args.device_shm_dir} && chmod 0700 {args.device_shm_dir}')}" )
     for allocator, binary in binaries.items():
         destination = f"{args.device_dir}/{binary.name}"
         if args.remote_host:
@@ -131,7 +138,8 @@ def deploy(args, binaries):
 
 def make_domain(session, allocator, execution):
     token = f"{session}_{allocator}_{execution}"
-    return re.sub(r"[^A-Za-z0-9_]", "_", token)[:100]
+    token = re.sub(r"[^A-Za-z0-9_]", "_", token)
+    return token if len(token) <= 96 else token[:70] + "_" + hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
 def benchmark_command(args, binary, env, bench_args):
@@ -141,12 +149,84 @@ def benchmark_command(args, binary, env, bench_args):
         return f"env {env_text} {shlex.quote(str(binary))} {argv}"
     device_binary = f"{args.device_dir}/{binary.name}"
     device = f"cd {shlex.quote(args.device_dir)} && env {env_text} ./{shlex.quote(binary.name)} {argv}"
+    if args.use_su:
+        device = f"su -c {shlex.quote(device)}"
     adb = shlex.quote(args.adb)
     serial = f" -s {shlex.quote(args.adb_serial)}" if args.adb_serial else ""
     return f"{adb}{serial} shell {shlex.quote(device)}"
 
 
+def cleanup_domain(args, domain):
+    if args.target == "host":
+        directory = "/dev/shm"
+    else:
+        directory = args.device_shm_dir
+    files = [f"{directory}/{domain}_{suffix}" for suffix in ("meta", "data")]
+    command = "rm -f -- " + " ".join(shlex.quote(path) for path in files)
+    if args.target == "host":
+        remote_shell(args.remote_host, command, capture=True)
+    else:
+        if args.use_su:
+            command = f"su -c {shlex.quote(command)}"
+        adb_command(args, command, capture=True)
+
+
+def environment_snapshot(args):
+    if args.target == "android":
+        command = f"sh {shlex.quote(args.device_dir + '/phone_bench_preflight.sh')} snapshot"
+        if args.use_su:
+            command = f"su -c {shlex.quote(command)}"
+        return adb_command(args, command, capture=True).stdout
+    return remote_shell(args.remote_host,
+        "uname -a; cat /proc/sys/kernel/random/boot_id /proc/uptime /proc/loadavg", capture=True).stdout
+
+
+def prepare_device(args, binaries, cpu, execution_modes):
+    if args.target != "android":
+        return
+    source = SCRIPT_DIR / "phone_bench_preflight.sh"
+    adb = [args.adb] + (["-s", args.adb_serial] if args.adb_serial else [])
+    if args.remote_host:
+        stage = f"{args.remote_stage_dir}/{source.name}"
+        remote_shell(args.remote_host, f"mkdir -p {shlex.quote(args.remote_stage_dir)}")
+        run(["scp", str(source), f"{args.remote_host}:{stage}"])
+        source_arg = stage
+    else:
+        source_arg = str(source)
+    remote_shell(args.remote_host, " ".join(shlex.quote(x) for x in
+        [*adb, "push", source_arg, f"{args.device_dir}/{source.name}"]), capture=True)
+    command = f"sh {shlex.quote(args.device_dir + '/' + source.name)} wait"
+    adb_command(args, command, capture=True)
+    for allocator, binary in binaries.items():
+        command = benchmark_command(args, binary,
+            {"MD_KERNEL_BRIDGE": "off", "SCUDO_DELEGATION_BACKEND": "0"}, ["--build-info"])
+        result = remote_shell(args.remote_host, command, capture=True, check=False)
+        if result.returncode:
+            raise RuntimeError(f"{allocator} 启动检查失败 exit={result.returncode}\n{result.stdout}{result.stderr}")
+        if "bench_protocol=async_checkpoint_v1" not in result.stdout:
+            raise RuntimeError(f"benchmark 未包含异步 checkpoint，需重新构建: {binary}")
+        if "kernel" in execution_modes:
+            domain = f"md_async_probe_{uuid.uuid4().hex}_{allocator}"
+            env = {"MD_KERNEL_BRIDGE": "required", "MEMORY_DELEGATION_DOMAIN": domain,
+                   "MD_SHM_DIR": args.device_shm_dir, "SCUDO_DELEGATION_BACKEND": "1",
+                   "SCUDO_SHARED_ARENA_DISABLE": "1"}
+            probe_args = ["--path", "delegated", "--mode", "thread", "--size", 131072,
+                          "--warmup", 5, "--iterations", 1, "--touch-pages", 0,
+                          "--cpus", cpu, "--workers-per-core", 1]
+            command = benchmark_command(args, binary, env, probe_args)
+            result = remote_shell(args.remote_host, command, capture=True, check=False,
+                                  timeout=args.command_timeout)
+            if result.returncode < 0 or result.returncode >= 128:
+                raise RuntimeError(f"异步内核探测异常终止，保留 domain={domain}: {result.stderr}")
+            cleanup_domain(args, domain)
+            if result.returncode or "pre_checkpoint=ok post_checkpoint=ok" not in result.stdout:
+                raise RuntimeError(f"{allocator} 异步内核探测失败，请检查内核 ABI / Arena 配置（新后端每核为完整 512 MiB；需要支持该上限的新内核，且不能与旧尺寸 Arena 混用）；domain={domain}\n{result.stderr}")
+
+
+
 def parse_output(text, allocator, execution, path, repetition, expected):
+    if "protocol=async_checkpoint_v1" not in text or "pre_checkpoint=ok post_checkpoint=ok" not in text:
+        raise RuntimeError("缺少成功的异步测量边界确认")
     header = config = None
     records = []
     for line in text.splitlines():
@@ -238,22 +318,53 @@ def main():
     parser.add_argument("--workers-per-core", default="1",
                         help="thread 模式为每核线程数，process 模式为每核进程数；1 core×N 对齐原同核竞争测试")
     parser.add_argument("--cpu-list", default="", help="候选物理核 CPU ID；默认按 topology 自动选每核一个 CPU")
-    parser.add_argument("--sizes", default="65536,131072,262144,1048576")
-    parser.add_argument("--iterations", type=int, default=200)
-    parser.add_argument("--warmup", type=int, default=50)
-    parser.add_argument("--repetitions", type=int, default=5)
-    parser.add_argument("--cold-runs", type=int, default=1)
+    parser.add_argument("--sizes", default="131072,262144,1048576")
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--cold-runs", type=int, default=0)
+    parser.add_argument("--continue-on-error", action="store_true",
+                        help="保留失败记录并继续其余测点；最终仍以非零状态退出")
+    parser.add_argument("--command-retries", type=int, default=0,
+                        help="benchmark 异常退出后的重试次数；失败输出会保留到 raw 目录")
     parser.add_argument("--paths", default="traditional,delegated")
     parser.add_argument("--remote-host", default=os.environ.get("REMOTE_HOST", ""))
     parser.add_argument("--remote-stage-dir", default="/tmp/md-allocator-bench")
     parser.add_argument("--device-dir", default="/data/local/tmp/md-allocator-bench")
+    parser.add_argument("--device-shm-dir", default="/dev/md_shm",
+                        help="Android 命名 backing 目录；内核模式必须位于 tmpfs")
+    parser.add_argument("--use-su", action="store_true", help="通过 su 运行手机端 benchmark")
     parser.add_argument("--adb", default=os.environ.get("ADB_BIN", "adb"))
     parser.add_argument("--adb-serial", default=os.environ.get("ADB_SERIAL", ""))
     parser.add_argument("--skip-deploy", action="store_true")
     parser.add_argument("--results-dir", default="")
     parser.add_argument("--dry-run", action="store_true", help="只打印完整矩阵命令，不执行、不部署")
+    parser.add_argument("--cooldown", type=float, default=0.5,
+                        help="每次运行结束后的间隔秒数，不计入测量")
+    parser.add_argument("--command-timeout", type=float, default=180,
+                        help="单次 benchmark 命令超时秒数")
     args = parser.parse_args()
+    if args.warmup < 1 or args.iterations < 1 or args.repetitions < 1 or args.cold_runs < 0:
+        raise RuntimeError("warmup/iterations/repetitions 必须为正数")
+    if args.command_retries < 0 or args.cooldown < 0 or args.command_timeout <= 0:
+        raise RuntimeError("重试/间隔必须非负，timeout 必须为正数")
+    lock_handle = None
+    try:
+        if not args.dry_run:
+            lock_path = SCRIPT_DIR.parent / "build/latency-bench.lock"
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_handle = lock_path.open("w")
+            try:
+                fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("已有 latency 矩阵运行中，不能并发 reset arena")
+        run_matrix(args)
+    finally:
+        if lock_handle:
+            lock_handle.close()
 
+
+def run_matrix(args):
     allocators = split_csv(args.allocators)
     binaries = {"scudo": Path(args.scudo_binary), "jemalloc": Path(args.jemalloc_binary)}
     unknown = set(allocators) - set(binaries)
@@ -279,19 +390,28 @@ def main():
     worker_counts = split_csv(args.workers_per_core, int)
     touch_modes = split_csv(args.touch_page_modes, int)
     sizes = split_csv(args.sizes, int)
+    if "delegated" in paths and any(size * max(worker_counts) >= 512 * 1024 * 1024 for size in sizes):
+        raise RuntimeError("delegated 单 arena 为 512 MiB；size × 每核 worker 数须小于容量（还需预留 allocator 元数据）")
     if set(touch_modes) - {0, 1} or any(value < 1 for value in worker_counts):
         raise RuntimeError("touch 只能为 0/1，workers-per-core 必须大于 0")
 
     if args.target == "android" and not args.skip_deploy and not args.dry_run:
         deploy(args, {key: binaries[key] for key in allocators})
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if not args.dry_run:
+        prepare_device(args, {key: binaries[key] for key in allocators}, cpus[0], execution_modes)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "_" + uuid.uuid4().hex[:8]
     results = Path(args.results_dir) if args.results_dir else SCRIPT_DIR / "results" / stamp
     raw_dir = results / "raw"
     if not args.dry_run:
         raw_dir.mkdir(parents=True, exist_ok=True)
+        (results / "config.json").write_text(json.dumps(vars(args), indent=2) + "\n")
+        manifest = SCRIPT_DIR.parent / "build/allocator_latency_android_manifest.json"
+        if args.target == "android" and manifest.is_file():
+            (results / "build_manifest.json").write_text(manifest.read_text())
 
     records = []
+    failures = []
     for allocator in allocators:
         for execution in execution_modes:
             for touch in touch_modes:
@@ -304,10 +424,15 @@ def main():
                                     for run_index in range(args.cold_runs + args.repetitions):
                                         cold = run_index < args.cold_runs
                                         repetition = 0 if cold else run_index - args.cold_runs + 1
+                                        domain_suffix = (f"t{touch}_{mode}_{core_count}_{wpc}_{size}_{path}_"
+                                                         f"{run_index}")
                                         env = {
                                             "MD_KERNEL_BRIDGE": "off" if execution == "userspace" else "required",
-                                            "MEMORY_DELEGATION_DOMAIN": make_domain(stamp, allocator, execution),
+                                            "MEMORY_DELEGATION_DOMAIN": make_domain(
+                                                stamp, allocator, f"{execution}_{domain_suffix}"),
                                         }
+                                        if args.target == "android" and args.device_shm_dir:
+                                            env["MD_SHM_DIR"] = args.device_shm_dir
                                         if allocator == "scudo":
                                             env.update({
                                                 "SCUDO_DELEGATION_BACKEND": "1" if path == "delegated" else "0",
@@ -326,8 +451,48 @@ def main():
                                         print(f"[run] {label}\n  {command}", flush=True)
                                         if args.dry_run:
                                             continue
-                                        result = remote_shell(args.remote_host, command, capture=True)
                                         raw_name = re.sub(r"[^A-Za-z0-9_.-]", "_", label) + ".txt"
+                                        result = None
+                                        for attempt in range(args.command_retries + 1):
+                                            attempt_env = dict(env)
+                                            attempt_env["MEMORY_DELEGATION_DOMAIN"] = (
+                                                env["MEMORY_DELEGATION_DOMAIN"] + f"_a{attempt}")
+                                            command = benchmark_command(args, binaries[allocator], attempt_env, bench_args)
+                                            snapshot_path = raw_dir / f"{raw_name}.attempt{attempt + 1}.environment"
+                                            before = environment_snapshot(args)
+                                            try:
+                                                result = remote_shell(args.remote_host, command, capture=True,
+                                                    check=False, timeout=args.command_timeout)
+                                            except subprocess.TimeoutExpired as error:
+                                                # Do not continue/reset after timeout: remote children may be
+                                                # alive. Keep backing, diagnostics and fail the whole matrix.
+                                                snapshot_path.write_text(before + "\nTIMEOUT: matrix stopped; inspect worker PIDs\n")
+                                                raise RuntimeError(f"benchmark 超时，停止矩阵避免与残留 worker 重叠: {label}") from error
+                                            after = environment_snapshot(args)
+                                            snapshot_path.write_text("BEFORE\n" + before + "\nAFTER\n" + after)
+                                            if result.returncode < 0 or result.returncode >= 128:
+                                                (raw_dir / f"{raw_name}.attempt{attempt + 1}.failed").write_text(result.stdout + result.stderr)
+                                                raise RuntimeError(f"benchmark 被信号终止；停止矩阵，保留 backing 供排查: {label}")
+                                            if args.target == "android":
+                                                before_id = re.search(r"boot_id=(\S+)", before)
+                                                after_id = re.search(r"boot_id=(\S+)", after)
+                                                if not before_id or not after_id or before_id[1] != after_id[1] or "boot_completed=1" not in after:
+                                                    raise RuntimeError("设备运行中重启或未完成启动，停止矩阵")
+                                            cleanup_domain(args, attempt_env["MEMORY_DELEGATION_DOMAIN"])
+                                            if args.cooldown:
+                                                time.sleep(args.cooldown)
+                                            if result.returncode == 0:
+                                                break
+                                            failure = raw_dir / f"{raw_name}.attempt{attempt + 1}.failed"
+                                            failure.write_text(result.stdout + result.stderr, encoding="utf-8")
+                                            print(f"[retry] {label}: exit={result.returncode}, "
+                                                  f"attempt={attempt + 1}/{args.command_retries + 1}", flush=True)
+                                        if result is None or result.returncode != 0:
+                                            failures.append(label)
+                                            (results / "failures.txt").write_text("\n".join(failures) + "\n", encoding="utf-8")
+                                            if args.continue_on_error:
+                                                continue
+                                            raise RuntimeError(f"benchmark 连续失败: {label}\n失败日志: {failure}\n{result.stderr.strip() or result.stdout.strip()}")
                                         (raw_dir / raw_name).write_text(result.stdout + result.stderr, encoding="utf-8")
                                         if cold:
                                             continue
@@ -347,6 +512,8 @@ def main():
         plot_allocator(summary, allocator, output)
         print(f"[plot] {output}")
     print(f"[done] {results}")
+    if failures:
+        raise RuntimeError(f"矩阵已执行完，{len(failures)} 次运行失败；图表仅包含成功样本，详见 failures.txt")
 
 
 if __name__ == "__main__":

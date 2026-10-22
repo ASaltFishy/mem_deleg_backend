@@ -1,5 +1,6 @@
 #include "delegation_backend.h"
 #include "kernel_bridge.h"
+#include "include/uapi/linux/memory_delegation.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -12,10 +13,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
+#if defined(__x86_64__) && defined(__GLIBC__)
 #include <sys/rseq.h>
+#endif
 #include <time.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <limits.h>
 
 inline void *operator new(size_t, void *Pointer) noexcept { return Pointer; }
 
@@ -51,8 +55,31 @@ using ::memset;
 
 namespace {
 
+static int openSharedObject(const char *Name, int Flags, mode_t Mode) {
+#if defined(__ANDROID__)
+  if (!Name || Name[0] != '/' || strchr(Name + 1, '/')) {
+    errno = EINVAL;
+    return -1;
+  }
+  const char *Directory = getenv("MD_SHM_DIR");
+  if (!Directory || !Directory[0])
+    Directory = "/data/local/tmp";
+  char Path[PATH_MAX];
+  int Length = snprintf(Path, sizeof(Path), "%s/%s", Directory, Name + 1);
+  if (Length < 0 || static_cast<size_t>(Length) >= sizeof(Path)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return open(Path, Flags, Mode);
+#else
+  return shm_open(Name, Flags, Mode);
+#endif
+}
+
 constexpr uint64_t kMagic = 0x4d4442454e443031ULL;
-constexpr uint32_t kVersion = 4;
+constexpr uint32_t kVersion = 5;
+constexpr uint32_t kKernelChannels = 128;
+constexpr size_t kMaxKernelPageSize = 65536;
 constexpr uint32_t kNoIndex = UINT32_MAX;
 constexpr uint32_t kNoOwner = UINT32_MAX;
 constexpr uint32_t kMaxRuns = 8192;
@@ -74,9 +101,12 @@ struct alignas(64) RunDescriptor {
   uint64_t LastSession;
   uint32_t LastOwner;
   uint32_t QueueNext;
+  uint32_t KernelChannel;
+  uint32_t KernelTicket;
+  uint32_t ReleaseCounted;
 };
 
-struct alignas(64) SharedMetadata {
+struct alignas(kMaxKernelPageSize) SharedMetadata {
   uint64_t Magic;
   uint32_t Version;
   uint32_t PageSize;
@@ -115,6 +145,11 @@ struct alignas(64) SharedMetadata {
   uint64_t QueueContentions;
   uint64_t QueueWaitNs;
   RunDescriptor Runs[kMaxRuns];
+  md_atomic::Atomic<uint32_t> KernelChannelUsed[kKernelChannels];
+  // Shared completion heads must be readable by unrelated attaching processes.
+  // Reserve virtually; only registered runtime-page-sized rings become resident.
+  alignas(kMaxKernelPageSize) unsigned char
+      KernelRings[kKernelChannels][kMaxKernelPageSize];
 };
 
 struct BackendImpl {
@@ -515,6 +550,38 @@ static md_backend arenaView(md_backend *Backend, uint32_t Arena) {
   return View;
 }
 
+static int openKernelBridge(md_backend *Backend, uint32_t Arena, bool Reset) {
+  SharedMetadata *Metadata = Backend->Impl.Metadata + Arena;
+  if (Backend->Impl.PageSize > kMaxKernelPageSize)
+    return ENOTSUP;
+  uint32_t Channel = 0;
+  for (; Channel < kKernelChannels; ++Channel) {
+    uint32_t Expected = 0;
+    if (__atomic_compare_exchange_n(
+            &Metadata->KernelChannelUsed[Channel].Storage, &Expected, 1U,
+            false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      break;
+  }
+  if (Channel == kKernelChannels)
+    return ENOSPC;
+  md_kernel_bridge_config Config{};
+  Config.arena_cpu = Arena;
+  Config.arena_data_base = reinterpret_cast<uintptr_t>(Backend->Impl.Payload) +
+      static_cast<uintptr_t>(Arena) * Backend->Impl.ArenaStride;
+  Config.arena_nr_pages = static_cast<uint32_t>(
+      Backend->Impl.Capacity / Backend->Impl.PageSize);
+  Config.reset_arena = Reset;
+  Config.mode = Backend->Impl.KernelMode;
+  Config.ring_memory = Metadata->KernelRings[Channel];
+  Config.channel_id = Channel;
+  int Error = md_kernel_bridge_open(&Backend->Impl.KernelBridges[Arena], &Config);
+  if (!Error && !Backend->Impl.KernelBridges[Arena])
+    Metadata->KernelChannelUsed[Channel].store(0, __ATOMIC_RELEASE);
+  // Registered channels are never recycled: the kernel pins their pages until
+  // mm exit, and pending descriptors may still reference completion tickets.
+  return Error;
+}
+
 static int refreshKernelBridgesAfterFork(md_backend *Backend) {
   if (!Backend || Backend->Impl.KernelDisabled)
     return 0;
@@ -527,16 +594,7 @@ static int refreshKernelBridgesAfterFork(md_backend *Backend) {
     Backend->Impl.KernelBridges[Arena] = nullptr;
   }
   for (uint32_t Arena = 0; Arena < Backend->Impl.ArenaCount; ++Arena) {
-    md_kernel_bridge_config Config{};
-    Config.arena_cpu = Arena;
-    Config.arena_data_base =
-        reinterpret_cast<uintptr_t>(Backend->Impl.Payload) +
-        static_cast<uintptr_t>(Arena) * Backend->Impl.ArenaStride;
-    Config.arena_nr_pages = static_cast<uint32_t>(
-        Backend->Impl.Capacity / Backend->Impl.PageSize);
-    Config.mode = Backend->Impl.KernelMode;
-    int Error = md_kernel_bridge_open(&Backend->Impl.KernelBridges[Arena],
-                                      &Config);
+    int Error = openKernelBridge(Backend, Arena, false);
     if (Error)
       return Error;
   }
@@ -563,12 +621,48 @@ static void drainLocked(SharedMetadata *Metadata) {
   pthread_mutex_unlock(&Metadata->QueueLock);
   while (Head != kNoIndex) {
     uint32_t Next = Metadata->Runs[Head].QueueNext;
+    RunDescriptor &Run = Metadata->Runs[Head];
+    bool Ready = true;
+    if (Run.KernelChannel != kNoIndex) {
+      auto *Ring = reinterpret_cast<md_log_ring *>(
+          Metadata->KernelRings[Run.KernelChannel]);
+      uint32_t Completed = __atomic_load_n(&Ring->head, __ATOMIC_ACQUIRE);
+      Ready = static_cast<int32_t>(Completed - Run.KernelTicket) >= 0 &&
+          !__atomic_load_n(&Ring->last_error, __ATOMIC_ACQUIRE);
+    }
+    if (!Ready) {
+      Run.QueueNext = kNoIndex;
+      queueLock(Metadata);
+      if (Metadata->QueueTail == kNoIndex)
+        Metadata->QueueHead.store(Head, __ATOMIC_RELEASE);
+      else
+        Metadata->Runs[Metadata->QueueTail].QueueNext = Head;
+      Metadata->QueueTail = Head;
+      pthread_mutex_unlock(&Metadata->QueueLock);
+      Head = Next;
+      continue;
+    }
     publishLocked(Metadata, Head);
     ++Metadata->RemoteDrained;
-    Metadata->ReleaseCalls.incrementLocked();
+    if (!Run.ReleaseCounted)
+      Metadata->ReleaseCalls.incrementLocked();
     Metadata->ReleaseSuccesses.incrementLocked();
     Head = Next;
   }
+}
+
+static void enqueuePending(SharedMetadata *Metadata, uint32_t Index) {
+  RunDescriptor &Run = Metadata->Runs[Index];
+  Run.QueueNext = kNoIndex;
+  Run.State.store(Pending, __ATOMIC_RELEASE);
+  queueLock(Metadata);
+  if (Metadata->QueueTail == kNoIndex)
+    Metadata->QueueHead.store(Index, __ATOMIC_RELEASE);
+  else
+    Metadata->Runs[Metadata->QueueTail].QueueNext = Index;
+  Metadata->QueueTail = Index;
+  ++Metadata->RemoteEnqueued;
+  pthread_mutex_unlock(&Metadata->QueueLock);
 }
 
 static thread_local uint32_t CachedPid;
@@ -606,10 +700,11 @@ extern "C" int md_backend_open(md_backend **Out, const md_config *Config) {
   char MetadataName[160], PayloadName[160];
   snprintf(MetadataName, sizeof(MetadataName), "/%s_meta", Config->domain);
   snprintf(PayloadName, sizeof(PayloadName), "/%s_data", Config->domain);
-  int MetadataFd = shm_open(MetadataName, O_RDWR | O_CREAT | O_EXCL, 0600);
+  int MetadataFd = openSharedObject(MetadataName,
+                                    O_RDWR | O_CREAT | O_EXCL, 0600);
   bool Created = MetadataFd >= 0;
   if (!Created && errno == EEXIST)
-    MetadataFd = shm_open(MetadataName, O_RDWR, 0600);
+    MetadataFd = openSharedObject(MetadataName, O_RDWR, 0600);
   if (MetadataFd < 0) return errno;
 #ifdef MD_TEST_FIRST_OPEN_DELAY
   // Force the name creator to lose the initialization-lock race in tests.
@@ -661,7 +756,8 @@ extern "C" int md_backend_open(md_backend **Out, const md_config *Config) {
   if (!Initialize && (Config->reset ||
                       MetaStat.st_size != static_cast<off_t>(MetadataSize)))
     return Fail(EINVAL);
-  PayloadFd = shm_open(PayloadName, O_RDWR | (Initialize ? O_CREAT : 0), 0600);
+  PayloadFd = openSharedObject(PayloadName,
+                               O_RDWR | (Initialize ? O_CREAT : 0), 0600);
   if (PayloadFd < 0) return Fail(errno);
   if (Initialize) {
     if (ftruncate(PayloadFd, static_cast<off_t>(PayloadSize)) != 0 ||
@@ -671,11 +767,23 @@ extern "C" int md_backend_open(md_backend **Out, const md_config *Config) {
     if (fstat(PayloadFd, &DataStat) != 0) return Fail(errno);
     if (DataStat.st_size != static_cast<off_t>(PayloadSize)) return Fail(EINVAL);
   }
+  // SharedMetadata contains page-aligned rings on all supported page sizes.
+  void *Reservation = mmap(nullptr, MetadataSize + kMaxKernelPageSize,
+                            PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Reservation == MAP_FAILED) return Fail(errno);
+  uintptr_t Raw = reinterpret_cast<uintptr_t>(Reservation);
+  uintptr_t Aligned = (Raw + kMaxKernelPageSize - 1) &
+                      ~(uintptr_t(kMaxKernelPageSize) - 1);
+  size_t Prefix = Aligned - Raw;
+  size_t Suffix = kMaxKernelPageSize - Prefix;
+  if (Prefix) munmap(Reservation, Prefix);
+  if (Suffix) munmap(reinterpret_cast<void *>(Aligned + MetadataSize), Suffix);
   Metadata = static_cast<SharedMetadata *>(
-      mmap(nullptr, MetadataSize, PROT_READ | PROT_WRITE, MAP_SHARED,
-           MetadataFd, 0));
+      mmap(reinterpret_cast<void *>(Aligned), MetadataSize,
+           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MetadataFd, 0));
   if (Metadata == MAP_FAILED) {
     int Error = errno;
+    munmap(reinterpret_cast<void *>(Aligned), MetadataSize);
     Metadata = nullptr;
     return Fail(Error);
   }
@@ -768,14 +876,7 @@ extern "C" int md_backend_open(md_backend **Out, const md_config *Config) {
   Backend->Impl.KernelPid = static_cast<uint32_t>(getpid());
   if (!KernelDisabled) {
     for (uint32_t Arena = 0; Arena < ArenaCount; ++Arena) {
-      md_kernel_bridge_config BridgeConfig{};
-      BridgeConfig.arena_cpu = Arena;
-      BridgeConfig.arena_data_base = Config->fixed_address +
-          static_cast<uintptr_t>(Arena) * ArenaStride;
-      BridgeConfig.arena_nr_pages = static_cast<uint32_t>(Capacity / PageSize);
-      BridgeConfig.reset_arena = Initialize;
-      BridgeConfig.mode = BridgeMode;
-      int Error = md_kernel_bridge_open(&KernelBridges[Arena], &BridgeConfig);
+      int Error = openKernelBridge(Backend, Arena, Initialize);
       if (Error) return Fail(Error);
     }
   }
@@ -789,6 +890,27 @@ extern "C" int md_backend_open(md_backend **Out, const md_config *Config) {
     return Fail(Error);
   }
   *Out = Backend;
+  return 0;
+}
+
+extern "C" int md_backend_checkpoint(md_backend *Backend) {
+  if (!Backend) return EINVAL;
+  int Error = refreshKernelBridgesAfterFork(Backend);
+  if (Error) return Error;
+  for (uint32_t Arena = 0; Arena < Backend->Impl.ArenaCount; ++Arena) {
+    md_kernel_bridge *Bridge = Backend->Impl.KernelBridges[Arena];
+    if (Bridge) {
+      Error = md_kernel_bridge_drain(Bridge);
+      if (Error) return Error;
+      if (md_kernel_bridge_pending(Bridge)) return EAGAIN;
+    }
+  }
+  for (uint32_t Arena = 0; Arena < Backend->Impl.ArenaCount; ++Arena) {
+    SharedMetadata *Metadata = Backend->Impl.Metadata + Arena;
+    lock(Metadata);
+    drainLocked(Metadata);
+    unlock(Metadata);
+  }
   return 0;
 }
 
@@ -968,8 +1090,9 @@ static int releaseLocal(md_backend *Backend, const md_lease *Lease,
         Impl.PageSize);
     uint32_t NumPages = static_cast<uint32_t>(Lease->size / Impl.PageSize);
     unlock(Metadata);
-    int Error = md_kernel_bridge_transition(
-        Impl.KernelBridge, MD_KERNEL_LOG_FREE, StartPage, NumPages, 0);
+    int Error = md_kernel_bridge_enqueue(
+        Impl.KernelBridge, MD_KERNEL_LOG_FREE, StartPage, NumPages, 0,
+        &Run.KernelTicket);
     lock(Metadata);
     if (Error) {
       Run.State.store(InUse, __ATOMIC_RELEASE);
@@ -977,6 +1100,14 @@ static int releaseLocal(md_backend *Backend, const md_lease *Lease,
       unlock(Metadata);
       return Error;
     }
+    Run.KernelChannel = md_kernel_bridge_channel(Impl.KernelBridge);
+    Run.ReleaseCounted = 1;
+    enqueuePending(Metadata, Lease->block_id);
+    if (OutCandidate) {
+      *OutCandidate = {kNoIndex, 0};
+    }
+    unlock(Metadata);
+    return 0;
   }
   uint32_t ResultIndex = publishLocked(Metadata, Lease->block_id);
   if (OutCandidate != nullptr) {
@@ -1108,6 +1239,7 @@ extern "C" int md_acquire_flags(md_backend *Backend, size_t Size, size_t Alignme
       (Flags & ~static_cast<unsigned>(MD_ZERO))) return EINVAL;
   int BridgeError = refreshKernelBridgesAfterFork(Backend);
   if (BridgeError) return BridgeError;
+  bool PressureDrained = false;
   for (;;) {
     int Arena = md_current_arena(Backend);
     if (Arena < 0) return ENOTSUP;
@@ -1129,6 +1261,18 @@ extern "C" int md_acquire_flags(md_backend *Backend, size_t Size, size_t Alignme
     View.Impl.Prelocked = true;
     int Result = acquireLocal(&View, Size, Alignment, Owner, Flags, Out);
     if (!Result) Out->block_id += static_cast<uint32_t>(Arena) * kMaxRuns;
+    // Large pending FREEs can exhaust the pool before the log ring fills.
+    // acquireLocal has dropped the metadata lock: drain only this mm/arena's
+    // channel once, then retry so drainLocked can publish acknowledged FREEs.
+    // This is pressure backpressure, never a per-allocation synchronization.
+    if ((Result == ENOMEM || Result == ENOSPC) && !PressureDrained &&
+        View.Impl.KernelBridge &&
+        md_kernel_bridge_pending(View.Impl.KernelBridge)) {
+      int Error = md_kernel_bridge_drain(View.Impl.KernelBridge);
+      if (Error) return Error;
+      PressureDrained = true;
+      continue;
+    }
     return Result;
   }
 }
@@ -1160,7 +1304,8 @@ extern "C" int md_release(md_backend *Backend, const md_lease *Lease,
   Local.block_id %= kMaxRuns;
   if (md_current_arena(Backend) == static_cast<int>(Arena)) {
     int Result = releaseLocal(&View, &Local, ClearPayload, Candidate);
-    if (!Result && Candidate) Candidate->block_id += Arena * kMaxRuns;
+    if (!Result && Candidate && Candidate->block_id != kNoIndex)
+      Candidate->block_id += Arena * kMaxRuns;
     return Result;
   }
   SharedMetadata *Metadata = View.Impl.Metadata;
@@ -1187,25 +1332,19 @@ extern "C" int md_release(md_backend *Backend, const md_lease *Lease,
         View.Impl.PageSize);
     uint32_t NumPages = static_cast<uint32_t>(Local.size /
                                               View.Impl.PageSize);
-    int Error = md_kernel_bridge_transition(
-        View.Impl.KernelBridge, MD_KERNEL_LOG_FREE, StartPage, NumPages, 0);
+    int Error = md_kernel_bridge_enqueue(
+        View.Impl.KernelBridge, MD_KERNEL_LOG_FREE, StartPage, NumPages, 0,
+        &Run.KernelTicket);
     if (Error) {
       Run.State.store(InUse, __ATOMIC_RELEASE);
       Run.ReleaseTicket.store(Local.generation, __ATOMIC_RELEASE);
       return Error;
     }
   }
-  Run.QueueNext = kNoIndex;
-  Run.State.store(Pending, __ATOMIC_RELEASE);
-  // Intrusive messages live in descriptors, never in payload. The mailbox lock
-  // is independent of the arena lock; producers never acquire the arena lock.
-  queueLock(Metadata);
-  if (Metadata->QueueTail == kNoIndex)
-    Metadata->QueueHead.store(Local.block_id, __ATOMIC_RELEASE);
-  else Metadata->Runs[Metadata->QueueTail].QueueNext = Local.block_id;
-  Metadata->QueueTail = Local.block_id;
-  ++Metadata->RemoteEnqueued;
-  pthread_mutex_unlock(&Metadata->QueueLock);
+  Run.KernelChannel = View.Impl.KernelBridge
+      ? md_kernel_bridge_channel(View.Impl.KernelBridge) : kNoIndex;
+  Run.ReleaseCounted = 0;
+  enqueuePending(Metadata, Local.block_id);
   if (Candidate) *Candidate = {kNoIndex, 0};
   return 0;
 }

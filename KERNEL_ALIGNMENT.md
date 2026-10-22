@@ -7,14 +7,16 @@ Target inspected and aligned on 2026-10-15:
 - backend tree: `/home/lrc/patent/memory-delegation-backend`;
 - ownership UAPI: `include/uapi/linux/memory_delegation.h`;
 - prctl UAPI: `PR_SET_MEMORY_DELEGATION_LOG` with RESET_ARENA,
-  DRAIN_LOG and EXTERNAL_BACKEND flags.
+  DRAIN_LOG, EXTERNAL_BACKEND and ASYNC_EXTERNAL flags.
 
 ## Implemented alignment
 
-The backend now opens one ownership-log bridge for every CPU arena. Successful
-acquires are recorded in the kernel before payload initialization, and releases
-are recorded before the descriptor is published as reusable. If either kernel
-transition fails, the backend does not publish the affected run. Forked
+The backend opens one per-mm ownership-log bridge for every CPU arena.
+ALLOC/FREE normally enqueue without an explicit drain. After releasing, the
+shared descriptor stays Pending until the shared channel head confirms the FREE
+has been consumed. Any attaching process can reap that confirmation before
+acquiring, without another allocator call by the releasing process. Failed
+channels remain poisoned and their pending blocks are not published. Forked
 children lazily register fresh per-mm rings before their first transition.
 
 Every arena is mapped as its own shared VMA. One unmapped guard page separates
@@ -51,20 +53,57 @@ unpatched development host. Set `MD_KERNEL_BRIDGE=required` to fail backend
 initialization unless the aligned kernel ABI is active, or
 `MD_KERNEL_BRIDGE=off` to disable registration explicitly.
 
-The bridge currently drains each transition synchronously. This makes the
-first aligned version easy to validate and prevents cross-process handoff from
-overtaking kernel ownership. Restoring context-switch batching without losing
-handoff ordering is a separate performance change and is not assumed here.
+The 2026-10-21 update uses `PR_MEMORY_DELEGATION_F_ASYNC_EXTERNAL` for explicit
+capability negotiation. An older kernel rejects the flag instead of silently
+using its owner-CPU-only drain rule. At switch-out the kernel consumes all
+registered asynchronous external rings of prev_mm; at switch-in it queues PTE
+updates for changed asynchronous arenas. Legacy ring semantics are preserved.
+A per-ctx irq-safe consumer lock prevents scheduler/overflow-drain duplication.
+
+Rings reside in shared metadata so independent attaching processes can observe
+completion. Metadata version is 5 and runtime pages up to 64 KiB are supported;
+a v4 domain is rejected, not overwritten. Each arena reserves 128 lifetime
+channels of 64 KiB virtual storage. Only the actual runtime page of a registered
+channel is touched. Channels are not recycled because kernel pins and Pending
+references outlive a userspace handle. Exhaustion returns ENOSPC. Optional
+unsupported-kernel probes return their unused slot.
+
+Only full-ring backpressure (yield, then drain if still full) and close retain
+explicit drain. Normal allocation and both local/remote free are asynchronous.
+Pending free may temporarily cause acquire to return ENOMEM until a scheduling
+boundary. Kernel-backed release returns an invalid cache candidate; allocators
+must retry through the backend after completion rather than reuse it directly.
 
 ## Deferred decisions
 
 - kernel-to-broker reclaim ring, generation acknowledgement and final publish;
 - Broker permission/audit enforcement for hostile metadata writers;
-- asynchronous batching policy for normal ownership transitions;
 - unregister ABI for closing and reopening a backend in the same `mm`;
 - Android broker distribution and protocol version negotiation.
 
-## Device validation
+## 2026-10-21 validation
+
+- Host build/UAPI checks and existing smoke tests pass.
+- Mock transport tests prove zero drain calls for normal ALLOC/local/remote FREE,
+  producer serialization, full-ring yield/fallback, sticky errors and fork close.
+- Two-process mock backend tests withhold completion: the full arena cannot be
+  reacquired before acknowledgement, and another process can obtain the same
+  zeroed address afterwards while the releaser makes no allocator calls.
+- The arm64 kernel builds successfully. QEMU runs 10 repetitions each of backend
+  local/remote asynchronous handoff, bridge context-switch/PTE isolation,
+  owner-death quarantine/error propagation, and independent-exec isolation.
+  All 40 invocations pass, without panic/oops/BUG/WARNING markers.
+- No phone boot, flash, reboot or allocator replacement was performed this time.
+
+The ABI still has no unregister. Do not close/reopen a kernel-enabled backend
+inside the same mm; tests use fresh processes per scenario. The first QEMU
+fixture hit this documented lifecycle limitation by reusing a registered ring
+VA for different backing; separating the fixture's mm lifetimes fixed it.
+No new throughput/latency claim is made; all-arena scans add scheduler work and
+need workload measurement, especially with many configured CPUs. Active-mms'
+remote PTE revocation retains the existing scheduling/task-work boundaries.
+
+## Historical device validation (2026-10-18)
 
 Validated on 2026-10-18 on a PLK110/OP60FFL1 test device using
 `fastboot boot`, without writing any boot or DLKM partition. The active-kernel
@@ -110,10 +149,7 @@ this test. A normal reboot changed the boot ID, preserved slot `_a`, left the
 `boot_a` SHA-256 unchanged, and the external-backend ABI probe returned to the
 unsupported-kernel fallback, confirming rollback to the persistent kernel.
 
-`kernel_external_backend_test.cpp` is the standalone static-friendly test used
-on the device. It deliberately requires the aligned ABI and is compiled but
-not run by the host smoke-test script. `kernel_context_switch_test.cpp` is the
-standalone same-CPU asynchronous-drain and live-process isolation test; it is
-also compiled but not run by the host smoke-test script.
-`kernel_unrelated_process_test.cpp` is the independently exec'd, shared-fd
-cross-process isolation test and follows the same compile-only host policy.
+The device and QEMU checks above were performed with standalone validation
+harnesses that are no longer retained in this repository. The maintained
+measurement entry point is the allocator latency microbenchmark documented in
+`tests/README.md`.

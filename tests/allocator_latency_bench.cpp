@@ -18,24 +18,38 @@
 #include <vector>
 
 #include <sched.h>
+#include <limits.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#include <signal.h>
 #include <unistd.h>
 
 #if defined(MD_BENCH_JEMALLOC)
 #include <jemalloc/jemalloc.h>
 #include "jemalloc_adapter.h"
+extern "C" int md_jemalloc_owns(void *Address);
 #elif !defined(MD_BENCH_SCUDO)
 #error "define exactly one of MD_BENCH_SCUDO or MD_BENCH_JEMALLOC"
+#else
+#include "scudo_delegation.h"
+#endif
+
+extern "C" int md_scudo_checkpoint();
+
+#ifndef MD_BENCH_BUILD_ID
+#define MD_BENCH_BUILD_ID "unversioned"
 #endif
 
 namespace {
+
+int allocatorCheckpoint(bool Delegated);
 
 using Clock = std::chrono::steady_clock;
 
 struct Options {
   size_t Size = 128 * 1024;
-  uint64_t Iterations = 200;
-  uint32_t Warmup = 50;
+  uint64_t Iterations = 10;
+  uint32_t Warmup = 5;
   uint32_t WorkersPerCore = 1;
   bool TouchPages = true;
   bool Delegated = false;
@@ -48,6 +62,7 @@ struct Samples {
   std::vector<uint64_t> Hold;
   std::vector<uint64_t> Dealloc;
   std::vector<uint64_t> Round;
+  uint64_t Noise[4] = {}; // minor/major faults, voluntary/involuntary switches.
 };
 
 struct Stats {
@@ -60,9 +75,11 @@ struct Stats {
 class Barrier {
 public:
   explicit Barrier(unsigned Count) : Remaining(Count) {}
-  void wait() {
+  void wait(std::atomic<int> &Error, bool Delegated) {
     std::unique_lock<std::mutex> Lock(Mutex);
     if (--Remaining == 0) {
+      int Result = allocatorCheckpoint(Delegated);
+      if (Result) Error.store(Result);
       Ready = true;
       Cv.notify_all();
       return;
@@ -79,6 +96,23 @@ private:
 #if defined(MD_BENCH_JEMALLOC)
 unsigned JemallocArena = 0;
 #endif
+
+int allocatorCheckpoint(bool Delegated) {
+  if (!Delegated) return 0;
+#if defined(MD_BENCH_JEMALLOC)
+  return md_jemalloc_checkpoint();
+#else
+  return md_scudo_checkpoint();
+#endif
+}
+
+void prepareSamples(Samples &Out, uint64_t Count) {
+  // resize initializes every sample page before warmup and the start barrier.
+  Out.Alloc.resize(Count);
+  Out.Hold.resize(Count);
+  Out.Dealloc.resize(Count);
+  Out.Round.resize(Count);
+}
 
 uint64_t nowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -101,7 +135,16 @@ void releaseObject(void *Pointer) {
 #endif
 }
 
+bool isDelegatedObject(void *Pointer) {
+#if defined(MD_BENCH_JEMALLOC)
+  return md_jemalloc_owns(Pointer) != 0;
+#else
+  return scudo::scudoDelegationContains(reinterpret_cast<uintptr_t>(Pointer));
+#endif
+}
+
 bool pinToCpu(int Cpu) {
+  if (Cpu < 0 || Cpu >= CPU_SETSIZE) { errno = EINVAL; return false; }
   cpu_set_t Set;
   CPU_ZERO(&Set);
   CPU_SET(Cpu, &Set);
@@ -123,6 +166,10 @@ int runWarmup(const Options &Opt) {
     void *Pointer = allocateObject(Opt.Size);
     if (!Pointer)
       return ENOMEM;
+    if (Opt.Delegated && !isDelegatedObject(Pointer)) {
+      releaseObject(Pointer);
+      return ENOTSUP;
+    }
     if (Opt.TouchPages)
       touchPages(Pointer, Opt.Size);
     releaseObject(Pointer);
@@ -130,41 +177,52 @@ int runWarmup(const Options &Opt) {
   return 0;
 }
 
-void runWorker(const Options &Opt, int Cpu, Barrier *Start, Samples &Out,
-               std::atomic<int> &Error) {
+void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
+               Samples &Out, std::atomic<int> &Error, bool Prepared = false) {
   int LocalError = 0;
-  if (!pinToCpu(Cpu))
-    LocalError = errno ? errno : EINVAL;
-  if (!LocalError)
-    LocalError = runWarmup(Opt);
-  if (LocalError)
-    Error.store(LocalError);
-  if (Start)
-    Start->wait();
-  if (LocalError)
-    return;
-  Out.Alloc.reserve(Opt.Iterations);
-  Out.Hold.reserve(Opt.Iterations);
-  Out.Dealloc.reserve(Opt.Iterations);
-  Out.Round.reserve(Opt.Iterations);
-  for (uint64_t I = 0; I < Opt.Iterations; ++I) {
-    const uint64_t T0 = nowNs();
-    void *Pointer = allocateObject(Opt.Size);
-    const uint64_t T1 = nowNs();
-    if (!Pointer) {
-      Error.store(ENOMEM);
-      return;
-    }
-    if (Opt.TouchPages)
-      touchPages(Pointer, Opt.Size);
-    const uint64_t T2 = nowNs();
-    releaseObject(Pointer);
-    const uint64_t T3 = nowNs();
-    Out.Alloc.push_back(T1 - T0);
-    Out.Hold.push_back(T2 - T1);
-    Out.Dealloc.push_back(T3 - T2);
-    Out.Round.push_back(T3 - T0);
+  if (!Prepared) {
+    if (!pinToCpu(Cpu)) LocalError = errno ? errno : EINVAL;
+    prepareSamples(Out, Opt.Iterations);
+    if (!LocalError) LocalError = runWarmup(Opt);
   }
+  if (LocalError) Error.store(LocalError);
+  if (Start) Start->wait(Error, Opt.Delegated);
+  rusage Before{}, After{};
+  if (getrusage(RUSAGE_THREAD, &Before)) Error.store(errno);
+  uint64_t Completed = 0;
+  if (!Error.load()) {
+    for (uint64_t I = 0; I < Opt.Iterations && !Error.load(); ++I) {
+      const uint64_t T0 = nowNs();
+      void *Pointer = allocateObject(Opt.Size);
+      const uint64_t T1 = nowNs();
+      if (!Pointer) { Error.store(ENOMEM); break; }
+      if (Opt.Delegated && !isDelegatedObject(Pointer)) {
+        releaseObject(Pointer);
+        Error.store(ENOTSUP);
+        break;
+      }
+      if (Opt.TouchPages) touchPages(Pointer, Opt.Size);
+      const uint64_t T2 = nowNs();
+      releaseObject(Pointer);
+      const uint64_t T3 = nowNs();
+      Out.Alloc[I] = T1 - T0;
+      Out.Hold[I] = T2 - T1;
+      Out.Dealloc[I] = T3 - T2;
+      Out.Round[I] = T3 - T0;
+      ++Completed;
+    }
+  }
+  if (getrusage(RUSAGE_THREAD, &After)) Error.store(errno);
+  Out.Noise[0] = After.ru_minflt - Before.ru_minflt;
+  Out.Noise[1] = After.ru_majflt - Before.ru_majflt;
+  Out.Noise[2] = After.ru_nvcsw - Before.ru_nvcsw;
+  Out.Noise[3] = After.ru_nivcsw - Before.ru_nivcsw;
+  // All measured workers finish before any thread performs the final drain.
+  if (Finish) Finish->wait(Error, Opt.Delegated);
+  Out.Alloc.resize(Completed);
+  Out.Hold.resize(Completed);
+  Out.Dealloc.resize(Completed);
+  Out.Round.resize(Completed);
 }
 
 bool writeExact(int Fd, const void *Data, size_t Size) {
@@ -196,6 +254,7 @@ bool readExact(int Fd, void *Data, size_t Size) {
 }
 
 bool sendSamples(int Fd, const Samples &Value, int Error) {
+  if (!writeExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!writeExact(Fd, &Error, sizeof(Error)))
     return false;
   const std::vector<uint64_t> *Vectors[] = {
@@ -210,6 +269,7 @@ bool sendSamples(int Fd, const Samples &Value, int Error) {
 }
 
 bool receiveSamples(int Fd, Samples &Value, int &Error) {
+  if (!readExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!readExact(Fd, &Error, sizeof(Error)))
     return false;
   std::vector<uint64_t> *Vectors[] = {
@@ -226,6 +286,7 @@ bool receiveSamples(int Fd, Samples &Value, int &Error) {
 }
 
 void appendSamples(Samples &To, Samples &&From) {
+  for (unsigned I = 0; I < 4; ++I) To.Noise[I] += From.Noise[I];
   auto Append = [](std::vector<uint64_t> &Dst, std::vector<uint64_t> &Src) {
     Dst.insert(Dst.end(), std::make_move_iterator(Src.begin()),
                std::make_move_iterator(Src.end()));
@@ -238,15 +299,15 @@ void appendSamples(Samples &To, Samples &&From) {
 
 int runThreads(const Options &Opt, Samples &Combined) {
   const unsigned Workers = Opt.Cpus.size() * Opt.WorkersPerCore;
-  Barrier Start(Workers);
+  Barrier Start(Workers), Finish(Workers);
   std::atomic<int> Error{0};
   std::vector<Samples> PerWorker(Workers);
   std::vector<std::thread> Threads;
   Threads.reserve(Workers);
   for (unsigned I = 0; I < Workers; ++I) {
     const int Cpu = Opt.Cpus[I % Opt.Cpus.size()];
-    Threads.emplace_back(runWorker, std::cref(Opt), Cpu, &Start,
-                         std::ref(PerWorker[I]), std::ref(Error));
+    Threads.emplace_back(runWorker, std::cref(Opt), Cpu, &Start, &Finish,
+                         std::ref(PerWorker[I]), std::ref(Error), false);
   }
   for (auto &Thread : Threads)
     Thread.join();
@@ -257,10 +318,23 @@ int runThreads(const Options &Opt, Samples &Combined) {
   return 0;
 }
 
-int runProcesses(const Options &Opt, Samples &Combined) {
+int runProcesses(const Options &Opt, const char *SelfExe, Samples &Combined) {
   const unsigned Workers = Opt.Cpus.size() * Opt.WorkersPerCore;
   struct Child { pid_t Pid; int ReadFd; int StartFd; };
   std::vector<Child> Children;
+  struct Cleanup {
+    std::vector<Child> &List;
+    ~Cleanup() {
+      for (auto &ChildValue : List) {
+        if (ChildValue.StartFd >= 0) close(ChildValue.StartFd);
+        if (ChildValue.ReadFd >= 0) close(ChildValue.ReadFd);
+        if (ChildValue.Pid > 0) kill(ChildValue.Pid, SIGTERM);
+      }
+      for (auto &ChildValue : List)
+        if (ChildValue.Pid > 0)
+          while (waitpid(ChildValue.Pid, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+  } Guard{Children};
   Children.reserve(Workers);
   for (unsigned I = 0; I < Workers; ++I) {
     int Fds[2];
@@ -273,26 +347,20 @@ int runProcesses(const Options &Opt, Samples &Combined) {
     if (Pid == 0) {
       close(Fds[0]);
       close(StartFds[1]);
-      Options ChildOpt = Opt;
-      std::atomic<int> Error{0};
-      if (!pinToCpu(Opt.Cpus[I % Opt.Cpus.size()]))
-        Error.store(errno ? errno : EINVAL);
-      if (!Error.load())
-        Error.store(runWarmup(Opt));
-      const unsigned char ReadyByte = 1;
-      if (!writeExact(Fds[1], &ReadyByte, sizeof(ReadyByte)))
-        _exit(1);
-      unsigned char StartByte = 0;
-      if (!readExact(StartFds[0], &StartByte, sizeof(StartByte)))
-        _exit(1);
-      close(StartFds[0]);
-      Samples Local;
-      ChildOpt.Warmup = 0;
-      if (!Error.load())
-        runWorker(ChildOpt, Opt.Cpus[I % Opt.Cpus.size()], nullptr, Local, Error);
-      const bool Ok = sendSamples(Fds[1], Local, Error.load());
-      close(Fds[1]);
-      _exit(Ok && !Error.load() ? 0 : 1);
+      char OutFd[32], StartFd[32], Cpu[32], Size[32], Iterations[32], Warmup[32];
+      std::snprintf(OutFd, sizeof(OutFd), "%d", Fds[1]);
+      std::snprintf(StartFd, sizeof(StartFd), "%d", StartFds[0]);
+      std::snprintf(Cpu, sizeof(Cpu), "%d", Opt.Cpus[I % Opt.Cpus.size()]);
+      std::snprintf(Size, sizeof(Size), "%zu", Opt.Size);
+      std::snprintf(Iterations, sizeof(Iterations), "%" PRIu64, Opt.Iterations);
+      std::snprintf(Warmup, sizeof(Warmup), "%u", Opt.Warmup);
+      execl(SelfExe, SelfExe, "--role", "worker", "--out-fd", OutFd,
+            "--start-fd", StartFd, "--cpu", Cpu, "--size", Size,
+            "--iterations", Iterations, "--warmup", Warmup,
+            "--touch-pages", Opt.TouchPages ? "1" : "0",
+            "--path", Opt.Delegated ? "delegated" : "traditional",
+            static_cast<char *>(nullptr));
+      _exit(127);
     }
     close(Fds[1]);
     close(StartFds[0]);
@@ -303,21 +371,40 @@ int runProcesses(const Options &Opt, Samples &Combined) {
     if (!readExact(ChildValue.ReadFd, &ReadyByte, sizeof(ReadyByte)) || ReadyByte != 1)
       return EIO;
   }
-  const unsigned char StartByte = 1;
+  int FirstError = 0;
+  const unsigned char DrainByte = 'D';
+  for (auto &ChildValue : Children)
+    if (!writeExact(ChildValue.StartFd, &DrainByte, 1)) return EIO;
+  for (auto &ChildValue : Children) {
+    int ChildError = 0;
+    if (!readExact(ChildValue.ReadFd, &ChildError, sizeof(ChildError))) return EIO;
+    if (ChildError && !FirstError) FirstError = ChildError;
+  }
+  const unsigned char StartByte = 'S';
   for (auto &ChildValue : Children) {
     if (!writeExact(ChildValue.StartFd, &StartByte, sizeof(StartByte)))
       return EIO;
-    close(ChildValue.StartFd);
   }
-  int FirstError = 0;
+  for (auto &ChildValue : Children) {
+    unsigned char DoneByte = 0;
+    if (!readExact(ChildValue.ReadFd, &DoneByte, 1) || DoneByte != 'E') return EIO;
+  }
+  const unsigned char FinishByte = 'F';
+  for (auto &ChildValue : Children) {
+    if (!writeExact(ChildValue.StartFd, &FinishByte, 1)) return EIO;
+    close(ChildValue.StartFd);
+    ChildValue.StartFd = -1;
+  }
   for (auto &ChildValue : Children) {
     Samples Local;
     int ChildError = 0;
     if (!receiveSamples(ChildValue.ReadFd, Local, ChildError) && !FirstError)
       FirstError = EIO;
     close(ChildValue.ReadFd);
+    ChildValue.ReadFd = -1;
     int Status = 0;
     while (waitpid(ChildValue.Pid, &Status, 0) < 0 && errno == EINTR) {}
+    ChildValue.Pid = -1;
     if ((!WIFEXITED(Status) || WEXITSTATUS(Status) != 0) && !FirstError)
       FirstError = ChildError ? ChildError : ECHILD;
     if (ChildError && !FirstError)
@@ -359,7 +446,7 @@ std::vector<int> parseCpus(const char *Text) {
   while (*Cursor) {
     char *End = nullptr;
     long Cpu = std::strtol(Cursor, &End, 10);
-    if (End == Cursor || Cpu < 0)
+    if (End == Cursor || Cpu < 0 || Cpu >= CPU_SETSIZE)
       return {};
     Result.push_back(static_cast<int>(Cpu));
     if (!*End)
@@ -399,7 +486,15 @@ void usage(const char *Argv0) {
 } // namespace
 
 int main(int Argc, char **Argv) {
+  if (Argc == 2 && !std::strcmp(Argv[1], "--build-info")) {
+    std::printf("bench_protocol=async_checkpoint_v1 build_id=%s\n", MD_BENCH_BUILD_ID);
+    return 0;
+  }
   Options Opt;
+  const char *Role = nullptr;
+  int RoleOutFd = -1;
+  int RoleStartFd = -1;
+  int RoleCpu = -1;
   for (int I = 1; I < Argc; ++I) {
     auto Need = [&](const char *Name) -> const char * {
       if (I + 1 >= Argc) {
@@ -424,6 +519,14 @@ int main(int Argc, char **Argv) {
       Opt.Delegated = !std::strcmp(Need(Argv[I]), "delegated");
     else if (!std::strcmp(Argv[I], "--mode"))
       Opt.ProcessMode = !std::strcmp(Need(Argv[I]), "process");
+    else if (!std::strcmp(Argv[I], "--role"))
+      Role = Need(Argv[I]);
+    else if (!std::strcmp(Argv[I], "--out-fd"))
+      RoleOutFd = std::strtol(Need(Argv[I]), nullptr, 0);
+    else if (!std::strcmp(Argv[I], "--start-fd"))
+      RoleStartFd = std::strtol(Need(Argv[I]), nullptr, 0);
+    else if (!std::strcmp(Argv[I], "--cpu"))
+      RoleCpu = std::strtol(Need(Argv[I]), nullptr, 0);
     else if (!std::strcmp(Argv[I], "--help") || !std::strcmp(Argv[I], "-h")) {
       usage(Argv[0]);
       return 0;
@@ -432,13 +535,14 @@ int main(int Argc, char **Argv) {
       return 2;
     }
   }
-  if (!Opt.Size || !Opt.Iterations || !Opt.WorkersPerCore || Opt.Cpus.empty()) {
+  if (!Opt.Size || !Opt.Iterations || !Opt.WorkersPerCore ||
+      (!Role && Opt.Cpus.empty())) {
     usage(Argv[0]);
     return 2;
   }
 
 #if defined(MD_BENCH_JEMALLOC)
-  if (Opt.Delegated) {
+  if (Opt.Delegated && (!Opt.ProcessMode || Role != nullptr)) {
     const char *Domain = std::getenv("MEMORY_DELEGATION_DOMAIN");
     if (!Domain || md_jemalloc_init(Domain, &JemallocArena)) {
       std::fprintf(stderr, "md_jemalloc_init failed\n");
@@ -447,8 +551,47 @@ int main(int Argc, char **Argv) {
   }
 #endif
 
+  if (Role) {
+    if (std::strcmp(Role, "worker") || RoleOutFd < 0 || RoleStartFd < 0 ||
+        RoleCpu < 0)
+      return 2;
+    std::atomic<int> Error{0};
+    Samples Local;
+    if (!pinToCpu(RoleCpu)) Error.store(errno ? errno : EINVAL);
+    prepareSamples(Local, Opt.Iterations);
+    if (!Error.load()) Error.store(runWarmup(Opt));
+    const unsigned char ReadyByte = 1;
+    if (!writeExact(RoleOutFd, &ReadyByte, 1)) return 1;
+    unsigned char Command = 0;
+    if (!readExact(RoleStartFd, &Command, 1) || Command != 'D') return 1;
+    int CheckError = allocatorCheckpoint(Opt.Delegated);
+    if (CheckError) Error.store(CheckError);
+    CheckError = Error.load();
+    if (!writeExact(RoleOutFd, &CheckError, sizeof(CheckError))) return 1;
+    if (!readExact(RoleStartFd, &Command, 1) || Command != 'S') return 1;
+    runWorker(Opt, RoleCpu, nullptr, nullptr, Local, Error, true);
+    const unsigned char DoneByte = 'E';
+    if (!writeExact(RoleOutFd, &DoneByte, 1)) return 1;
+    if (!readExact(RoleStartFd, &Command, 1) || Command != 'F') return 1;
+    close(RoleStartFd);
+    CheckError = allocatorCheckpoint(Opt.Delegated);
+    if (CheckError) Error.store(CheckError);
+    const bool Ok = sendSamples(RoleOutFd, Local, Error.load());
+    close(RoleOutFd);
+    return Ok && !Error.load() ? 0 : 1;
+  }
+
+  signal(SIGPIPE, SIG_IGN);
   Samples Combined;
-  const int Error = Opt.ProcessMode ? runProcesses(Opt, Combined)
+  char SelfExe[PATH_MAX];
+  const ssize_t SelfLength = readlink("/proc/self/exe", SelfExe,
+                                      sizeof(SelfExe) - 1);
+  if (SelfLength <= 0 || static_cast<size_t>(SelfLength) >= sizeof(SelfExe) - 1) {
+    std::fprintf(stderr, "cannot resolve /proc/self/exe\n");
+    return 1;
+  }
+  SelfExe[SelfLength] = '\0';
+  const int Error = Opt.ProcessMode ? runProcesses(Opt, SelfExe, Combined)
                                     : runThreads(Opt, Combined);
   if (Error) {
     std::fprintf(stderr, "benchmark failed: %s (%d)\n", std::strerror(Error), Error);
@@ -462,7 +605,13 @@ int main(int Argc, char **Argv) {
   std::printf("bench_config: mode=%s cores=%zu workers_per_core=%u touch_pages=%d\n",
               Opt.ProcessMode ? "process" : "thread", Opt.Cpus.size(),
               Opt.WorkersPerCore, Opt.TouchPages ? 1 : 0);
+  std::printf("bench_lifecycle: protocol=async_checkpoint_v1 warmup=%u iterations=%" PRIu64
+              " pre_checkpoint=ok post_checkpoint=ok build_id=%s\n",
+              Opt.Warmup, Opt.Iterations, MD_BENCH_BUILD_ID);
   std::printf("-- %s --\n", Opt.Delegated ? "delegated" : "traditional");
+  std::printf("bench_noise: worker_sum minor_faults=%" PRIu64 " major_faults=%" PRIu64
+              " voluntary_cs=%" PRIu64 " involuntary_cs=%" PRIu64 "\n",
+              Combined.Noise[0], Combined.Noise[1], Combined.Noise[2], Combined.Noise[3]);
   printMetric("alloc_only", Combined.Alloc);
   printMetric("hold_only", Combined.Hold);
   printMetric("dealloc_only", Combined.Dealloc);

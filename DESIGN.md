@@ -48,7 +48,7 @@ Remote frees return to the original arena, not the current CPU's arena.
 `md_config.capacity` now means capacity PER ARENA. The window is
 `[fixed_address, fixed_address + capacity * arena_count)`. There are
 `_SC_NPROCESSORS_CONF` arenas (up to 1024); CPU IDs outside that range are rejected.
-The adapters use 128 MiB per arena. This increases reserved VA/file size, not
+The adapters use 512 MiB per arena. This increases reserved VA/file size, not
 eager payload commitment; metadata descriptors are initialized lazily. Free
 capacity on an idle CPU is not usable by another CPU. This intentional static
 partitioning can strand capacity and is not a memory-balancing solution.
@@ -240,59 +240,14 @@ settings in one domain. `MD_TEST_RSEQ_DELAY` is a compile-only test hook adding
 register-only work before commit to expose real kernel aborts; production
 binaries and performance measurements do not define it.
 `MD_TEST_PREEMPT_LOCK` sleeps after partially linking a node while the arena
-lock is held. The dedicated same-CPU test requires measured lock contention,
-successful progress, and intact payloads; this macro is also test-only.
+lock is held. These are test-only hooks and are not used by the latency
+microbenchmark.
 
-`build.sh` runs allocator API/independent-process reuse tests and the new
-concurrency suite. Tests cover descriptor exhaustion/recycling, hint reuse,
-remote duplicate/stale releases, several producers, forked producer, same-CPU
-oversubscription, signal/migration rseq abort, rseq disabled, and unavailable
-registration. Memory reuse tests pin both participants to the same CPU because
-cross-CPU stealing is intentionally absent. The concurrency runner selects
-different physical cores and reports explicit skips on unsupported machines.
-
-`concurrency_bench.py` compares historical global locking, current single-arena
-futex, per-arena without rseq, and per-arena with rseq at 1/2/4/8 physical cores.
-It uses 4 KiB acquire/release with no payload touch and reports aggregate wall
-time per pair, NOT individual allocation latency. Historical counters are
-unavailable (zero fields are placeholders). A separate structure benchmark
-tests 4096 live descriptors and ascending fragmented free. See
-`reports/concurrency/REPORT.md` for results, regressions, and limitations.
-
-The original Scudo Combined latency harness was also rerun against a separately
-rebuilt bb48c74 baseline, with interleaved identical parameters. See
-`reports/historical-rerun/REPORT.md`: delegated all-time increased from
-610.47/626.61 ns to 631.38/649.29 ns (128/256 KiB). This is a different timing
-scope from allocator_test.cpp; do not compare their absolute numbers directly.
-
-`scudo_size_sweep.py` runs the original Combined harness in independently
-executed processes pinned to different physical cores. The same binary is
-tested with the backend enabled/disabled. It uses the original remote
-`run_shared_arena_microbench.py` parser, aggregation, and plotting functions;
-the plot label `delegated` now means this userspace backend, NOT old SharedArena.
-Each worker warms up before an external pipe barrier starts measurement. The
-benchmark-only routing count verifies every measured allocation's actual path
-outside the allocation/free timing intervals. It adds work to `hold_only` and
-`all`, so those metrics are not identical to historical uninstrumented runs.
-The plotted `alloc_only` and `dealloc_only` retain their original timer scopes.
-
-The sweep exposed a first-creation race: the metadata shm name becomes visible
-before payload creation and acquisition of the initialization flock. A new
-attacher can fail opening the payload, or validate incomplete metadata, and
-the Scudo adapter then permanently falls back in that process. The historical
-size-sweep report therefore used first-worker initialization before starting
-other attachers, analogous to the old donor phase. All measured workers still
-started together. The backend fix and subsequent concurrent-start regression
-are described below; the original sweep's data and methodology are unchanged.
-No kernel broker/device or ownership module participates. This does not bypass
-the ordinary Linux scheduler, VM implementation, or kernel rseq support.
-
-The requested size range is 16 KiB through 1 GiB, with 1/2/4/8 processes.
-Because capacity is 128 MiB per arena and Scudo needs header/alignment space,
-requests of 128 MiB or larger fall back; below that boundary Primary requests
-also never enter this backend. These points must not be described as delegated
-allocation wins. See `reports/scudo-size-sweep/REPORT.md` for the methodology,
-route verification, separate touch/no-touch curves, and measurement results.
+The maintained performance test is the allocator latency microbenchmark under
+`tests/`. It compares Scudo and jemalloc using matching allocation/free timing
+boundaries; the scripts and options are documented in `tests/README.md`.
+Historical reports describe earlier experiments and are not maintained test
+entry points.
 
 ### Concurrent first-open initialization
 
@@ -315,13 +270,17 @@ metadata but before publishing its header can leave a nonempty, invalid domain;
 later attach rejects it. Only after all participants stop may it be removed.
 External shm unlink/reset while participants are live remains unsupported.
 
-`first_open_test.cpp` runs 24 fresh domains with eight processes each. Four
-rounds pause the name creator before flock using a test-only pipe; the parent
-waits for every other process to finish before releasing it, deterministically
-exercising noncreator initialization. Tests check shared acquire/release totals,
-zero live bytes, reopen, incompatible capacity/reset rejection, address collision,
-and no FD leaks on those failures. `MD_TEST_FIRST_OPEN_DELAY` enables only the
-test pipe hook and is excluded from production builds. The Scudo sweep's
-`--concurrent-first-open` removes the first-worker initialization workaround
-while retaining the post-warmup measurement barrier. See
-`reports/first-open-fix/REPORT.md` for verification.
+Initialization is serialized under the shared metadata lock so a delayed
+creator attaches to an already initialized domain instead of truncating it.
+
+
+### Full 512 MiB external payload (2026-10-22)
+
+`MD_DEFAULT_ARENA_CAPACITY` is 512 MiB for both allocator adapters. Metadata is
+outside the payload, and one guard page separates adjacent CPU arenas. At 4 KiB
+page size the payload has 131072 pages. jemalloc derives its lease table span
+from the final arena layout and native page size, including guard holes.
+The kernel registration limit now accepts a full 512 MiB external payload;
+legacy in-band-header layouts remain 512 MiB minus one page. This requires the
+updated kernel. A reboot must clear any per-CPU ownership metadata initialized
+with the old 128 MiB size before the new benchmark can register.
