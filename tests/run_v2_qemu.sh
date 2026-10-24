@@ -25,9 +25,11 @@ for value in "$iterations" "$warmup" "$repetitions"; do [[ "$value" =~ ^[1-9][0-
 rm -f "$work/root/bin/allocator_latency_jemalloc"
 rm -f "$work/root/enable_latency"
 if [[ "$latency" == 1 ]]; then
+  strings "$root/build/allocator_latency_scudo.linux.aarch64" | grep "bench_protocol=shared_rings_v3" >/dev/null || { echo "Rebuild stale scudo binary for ABI v3" >&2; exit 1; }
   cp "$root/build/allocator_latency_scudo.linux.aarch64" "$work/root/bin/allocator_latency_scudo"
   touch "$work/root/enable_latency"
   if [[ "${RUN_JEMALLOC:-0}" == 1 ]]; then
+    strings "$root/build/allocator_latency_jemalloc.linux.aarch64" | grep "bench_protocol=shared_rings_v3" >/dev/null || { echo "Rebuild stale jemalloc binary for ABI v3" >&2; exit 1; }
     cp "$root/build/allocator_latency_jemalloc.linux.aarch64" "$work/root/bin/allocator_latency_jemalloc"
   fi
 fi
