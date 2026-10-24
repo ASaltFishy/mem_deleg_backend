@@ -203,7 +203,7 @@ def prepare_device(args, binaries, cpu, execution_modes):
         result = remote_shell(args.remote_host, command, capture=True, check=False)
         if result.returncode:
             raise RuntimeError(f"{allocator} 启动检查失败 exit={result.returncode}\n{result.stdout}{result.stderr}")
-        if "bench_protocol=async_checkpoint_v1" not in result.stdout:
+        if "bench_protocol=shared_rings_v3" not in result.stdout:
             raise RuntimeError(f"benchmark 未包含异步 checkpoint，需重新构建: {binary}")
         if "kernel" in execution_modes:
             domain = f"md_async_probe_{uuid.uuid4().hex}_{allocator}"
@@ -225,7 +225,7 @@ def prepare_device(args, binaries, cpu, execution_modes):
 
 
 def parse_output(text, allocator, execution, path, repetition, expected):
-    if "protocol=async_checkpoint_v1" not in text or "pre_checkpoint=ok post_checkpoint=ok" not in text:
+    if "protocol=shared_rings_v3" not in text or "pre_checkpoint=ok post_checkpoint=ok" not in text:
         raise RuntimeError("缺少成功的异步测量边界确认")
     header = config = None
     records = []

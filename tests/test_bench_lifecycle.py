@@ -18,9 +18,12 @@ class LifecycleTests(unittest.TestCase):
 namespace scudo { inline bool scudoDelegationContains(uintptr_t) { return true; } }
 ''')
         (cls.root/'hook.cpp').write_text('''#include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <fcntl.h>
 #include <unistd.h>
+extern "C" int __scudo_bench_is_primary(const void *) { return 0; }
+extern "C" void __scudo_bench_cache_stats(uint64_t *Calls, uint64_t *Hits) { *Calls=0; *Hits=0; }
 extern "C" int md_scudo_checkpoint() {
   int Fd = open(getenv("CHECKPOINT_TRACE"), O_WRONLY|O_APPEND|O_CREAT, 0600);
   if (Fd < 0) return 5;

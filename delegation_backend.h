@@ -28,6 +28,8 @@ typedef struct {
   uint64_t generation;
   uintptr_t address;
   size_t size;
+  uint64_t allocation_id;
+  uint64_t kernel_session;
 } md_lease;
 
 typedef struct {
@@ -63,9 +65,14 @@ typedef struct {
   uint64_t hint_hits;
   uint64_t queue_contentions;
   uint64_t queue_wait_ns;
+  uint64_t kernel_rejected;
+  uint64_t kernel_enabled;
 } md_stats;
 
 // CPU IDs are Linux logical IDs; benchmarks select one sibling per core.
+// Read kernel-maintained rseq CPU ID in userspace; safe syscall fallback.
+int md_cpu_current(void);
+const char *md_cpu_query_mode(void);
 int md_current_arena(md_backend *backend);
 unsigned md_arena_count(md_backend *backend);
 int md_get_arena_layout(md_backend *backend, unsigned arena,
@@ -74,9 +81,9 @@ int md_drain_remote(md_backend *backend, unsigned arena);
 
 int md_backend_open(md_backend **out, const md_config *config);
 void md_backend_close(md_backend *backend);
-// Administrative checkpoint: callers must pause allocator producers in this mm.
-// Drain all registered mm rings and reap completed FREEs without purging caches
-// or resetting arena truth. Never call from the measured allocation fast path.
+// Administrative checkpoint: caller pauses producers; schedules owner CPUs and
+// reaps receipts under their Arena Mutex. No explicit kernel drain/reset.
+// Never call from the measured allocation fast path.
 int md_backend_checkpoint(md_backend *backend);
 uint32_t md_process_id(void);
 

@@ -16,7 +16,7 @@ sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 OUTPUT = '''================== size=128.00 KiB, threads=1, unit=ns ==================
 bench_config: mode=thread cores=1 workers_per_core=1 touch_pages=1
-bench_lifecycle: protocol=async_checkpoint_v1 warmup=20 iterations=20 pre_checkpoint=ok post_checkpoint=ok
+bench_lifecycle: protocol=shared_rings_v3 warmup=20 iterations=20 pre_checkpoint=ok post_checkpoint=ok
 alloc_only mean=10.00 p50=10 p95=10 p99=10
 '''
 
@@ -73,7 +73,7 @@ class ProtocolTests(unittest.TestCase):
             use_su=True, device_shm_dir='/dev/md_shm', command_timeout=10)
         def shell(_host, command, **kwargs):
             if '--build-info' in command:
-                return subprocess.CompletedProcess([],0,'bench_protocol=async_checkpoint_v1','')
+                return subprocess.CompletedProcess([],0,'bench_protocol=shared_rings_v3','')
             if '--path' in command:
                 return subprocess.CompletedProcess([],1,'','kernel unsupported')
             return subprocess.CompletedProcess([],0,'','')

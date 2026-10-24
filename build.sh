@@ -23,7 +23,7 @@ if [[ -n "${KERNEL_TREE:-}" ]]; then
     "$KERNEL_TREE/include/uapi/linux/prctl.h"
   grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND[[:space:]]+\(1UL << 2\)$' \
     "$KERNEL_TREE/include/uapi/linux/prctl.h"
-  grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_ASYNC_EXTERNAL[[:space:]]+\(1UL << 3\)$' \
+  grep -Eq '^#define[[:space:]]+PR_MEMORY_DELEGATION_F_SHARED_RINGS[[:space:]]+\(1UL << 4\)$' \
     "$KERNEL_TREE/include/uapi/linux/prctl.h"
 else
   echo "KERNEL_TREE is unset; skipped live kernel-UAPI check"

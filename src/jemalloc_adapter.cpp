@@ -14,7 +14,7 @@ static extent_hooks_t *DefaultHooks;
 static thread_local bool PayloadRequest;
 extern "C" void md_jemalloc_request(int Enabled) { PayloadRequest = Enabled; }
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__aarch64__)
 static constexpr uintptr_t kDelegationBase = 0x2000000000ULL;
 #else
 static constexpr uintptr_t kDelegationBase = 0x280000000000ULL;

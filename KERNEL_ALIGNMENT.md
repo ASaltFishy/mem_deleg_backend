@@ -1,155 +1,58 @@
-# Kernel alignment status
+# 内核 / Backend / Scudo 对接记录（2026-10-22）
 
-Target inspected and aligned on 2026-10-15:
+最终规范是内核根目录 DESIGN.md §2.10、§2.11 及最新性能修订 §2.12。
+以下描述当前实现；原 per-mm ABI 的历史通过结果不算新协议验收。
 
-- kernel tree: `/home/lrc/patent/kernel/kernel_platform/common`;
-- kernel branch/worktree: `dev`, preserving its existing uncommitted work;
-- backend tree: `/home/lrc/patent/memory-delegation-backend`;
-- ownership UAPI: `include/uapi/linux/memory_delegation.h`;
-- prctl UAPI: `PR_SET_MEMORY_DELEGATION_LOG` with RESET_ARENA,
-  DRAIN_LOG, EXTERNAL_BACKEND and ASYNC_EXTERNAL flags.
+## 共享状态与协议
 
-## Implemented alignment
+- 元数据版本 7，公共 md_lease 增加 allocation_id 和 kernel_session。描述符 generation、Arena 分配实例序号、内核 owner-slot generation 相互独立。
+- 每 Arena 一对共享 FIFO，日志在 payload 外，由 broker backing 持有。桥接句柄只有私有 session，不拥有共享日志生命周期。
+- 普通 ALLOC 在同一进程共享 Mutex 内准备描述符、完整日志、release tail，再完成状态发布。无 ProducerLock。
+- 允许 Mutex 持有者迁核。普通 FREE 在 Mutex 内先准备 Pending、发布日志，再检查 CPU：仍在 owner CPU 则立即入池；已迁出则等回执。跨核 FREE 继续等回执。普通同核成功回执只回收日志，禁止重复入池。正常操作不设置 affinity。
+- 初始就在远端 CPU 的释放只根据保存的完整 lease 构造请求、CAS 预订日志槽、写记录并 release ready。远端不读/写描述符，不拿 Arena Mutex，不设置 Pending，不推进 generation。
+- owner CPU 用户态维护独立 reclaimed，acquire completed 后检查每 ticket 的 result、block、generation、allocation_id、session、范围和状态，再入池。消费完成本身不代表成功。
+- 被拒绝记录保存在 16 条最近错误回执中并累计计数；匹配当前租约的错误不会入池，必要时隔离。普通日志错误使该 Arena fail closed。计数可经 md_get_stats 读取，kernel_enabled 报实际注册 Arena 数。
+- 跨核清零请求使用 md_shared_slot.reserved 的用户态 opaque bit 0，内核不读取它。只有成功回执及租约核对之后，用户态才清零并发布；过期 FREE/clear 不会先写新租约 payload。record.reserved 仍必须为 0。
+- kernel-off 模式同样使用原子 remote ring，由 owner 用户态模拟消费并按次序验证；这只是兼容用户态测试，不证明 PTE 隔离。
 
-The backend opens one per-mm ownership-log bridge for every CPU arena.
-ALLOC/FREE normally enqueue without an explicit drain. After releasing, the
-shared descriptor stays Pending until the shared channel head confirms the FREE
-has been consumed. Any attaching process can reap that confirmation before
-acquiring, without another allocator call by the releasing process. Failed
-channels remain poisoned and their pending blocks are not published. Forked
-children lazily register fresh per-mm rings before their first transition.
+## 生命周期和入口
 
-Every arena is mapped as its own shared VMA. One unmapped guard page separates
-adjacent arenas, which prevents Linux from merging the mappings and lets the
-kernel attach an independent ownership fault wrapper to each arena. The guard
-is virtual address space only; it does not reserve physical payload memory and
-is not a private allocation cache. Callers must use `md_get_arena_layout()`
-rather than deriving arena addresses as `base + arena * capacity`.
+Linux 可用具名 shmem；Android 客户端只走 Unix SOCK_SEQPACKET + SCM_RIGHTS attach。
+broker 自身创建 memfd、初始化元数据并持有 FD，验证域名、VA、容量、CPU 数与页大小后发放两个 FD。
+没有应用侧自动 creator、临时 broker 或 fork-broker。
 
-`PR_MEMORY_DELEGATION_F_EXTERNAL_BACKEND` tells the kernel that reusable-run
-metadata is stored outside payload pages. Normal FREE records therefore do not
-prefault or write an intrusive payload freelist header.
+md_backend_close 只关闭私有句柄/映射/FD，不 drain、不重置共享日志。相同 mm 可以重开相同 backing；新映射仍使用同一日志页面和内核 session。不能更换为不同 backing 规避注册约束。
+进程死亡、未完成预订、Mutex 持有者死亡均不自动修复。broker 死亡后重新建立新 backing 的恢复协议不在本次范围。
 
-## Deliberately incomplete owner-death behavior
+md_backend_checkpoint 是生产者暂停后的管理入口：暂时调度到各 owner CPU、让调度钩子消费，并在 Mutex 下回收；不调用 DRAIN prctl，不强制复用未完成记录。无法访问的 CPU 或发布空洞会返回错误/超时。它不在测量区间，不是每次 malloc/free 的路径。
 
-The future broker/reclaimer protocol is intentionally not implemented yet.
-When an externally-backed process exits, the kernel now:
+rseq 锁入口原型暂不用于这个 pthread Mutex 版本，统计会如实显示 0；未声称保留旧 rseq 速度。
+旧域/旧租约布局与 v7 不兼容，禁止在参与者存活时重置或删除 backing。
 
-1. drains its final ownership logs;
-2. removes the dead `mm` from the owner table;
-3. marks its remaining pages with the internal `RECLAIM_PENDING` sentinel;
-4. revokes access and refuses new ALLOC records for those pages.
+## 适配器
 
-The userspace descriptor remains `IN_USE`, so the memory is safely quarantined
-instead of being inserted into either the legacy freelist or the new global
-free index. This leaks capacity after an abnormal process death until the
-planned kernel-to-broker reclaim protocol is added, but it cannot create a
-double allocation.
+LLVM standalone 工作树已接入最小 Secondary hook，同时保留旧 inactive cache-first 实现。显式开启统一后端并关闭旧 SharedArena 后，新路径先从 Backend 获取 lease；释放完成原有 InUseBlocks/header/statistics 处理后才发布 FREE，之后不再访问 payload。
+适配器源维护在 adapters/scudo_delegation.*，standalone 通过 wrapper 共享同一实现。
+Linux 和 Android builder 都从实际 LLVM 工作树取源，不依赖临时旧 Scudo snapshot。
 
-## Current runtime policy
+jemalloc 保存完整 lease，发布前清空自己的 lease 表条目；继续依赖现有 PAC 补丁保证不等 dirty/muzzy 淘汰才交接。
+本原型沿用统一后端原有布局：委托 Secondary 没有额外边界 guard page，MTE 请求回退；不能据此声称完整分配器安全性已验证。
 
-Kernel integration defaults to optional so the prototype still runs on an
-unpatched development host. Set `MD_KERNEL_BRIDGE=required` to fail backend
-initialization unless the aligned kernel ABI is active, or
-`MD_KERNEL_BRIDGE=off` to disable registration explicitly.
+## 验证边界
 
-The 2026-10-21 update uses `PR_MEMORY_DELEGATION_F_ASYNC_EXTERNAL` for explicit
-capability negotiation. An older kernel rejects the flag instead of silently
-using its owner-CPU-only drain rule. At switch-out the kernel consumes all
-registered asynchronous external rings of prev_mm; at switch-in it queues PTE
-updates for changed asynchronous arenas. Legacy ring semantics are preserved.
-A per-ctx irq-safe consumer lock prevents scheduler/overflow-drain duplication.
+主机编译/UAPI 对比、Python runner/lifecycle/preflight 控制流测试；AArch64 静态 Linux 和 Android native-TLS 编译。
+QEMU 用实际新内核，常驻 memfd broker + 独立进程 FD attach，测试远端回执回收、stale/duplicate/clear、强制持锁迁核、split/merge 后复用、跨进程同 VA 清零、fork 隔离和同 mm 重开。
+前一轮 Scudo 验证已覆盖 128 KiB、256 KiB、1 MiB，thread/process，单 worker/同核竞争/双核，触页/不触页，traditional/delegated 共 72 组（当时每组 5 轮预热、50 轮测量）。
+当前入口按用户要求默认快速矩阵：128 KiB、双核 thread、触页、两种路径，预热 5 次、测量 10 次、每组重复 2 次；`MATRIX=full` 扩大矩阵。委托路由和前后 checkpoint 必须通过，不能用减小计数绕过校验。
 
-Rings reside in shared metadata so independent attaching processes can observe
-completion. Metadata version is 5 and runtime pages up to 64 KiB are supported;
-a v4 domain is rejected, not overwritten. Each arena reserves 128 lifetime
-channels of 64 KiB virtual storage. Only the actual runtime page of a registered
-channel is touched. Channels are not recycled because kernel pins and Pending
-references outlive a userspace handle. Exhaustion returns ENOSPC. Optional
-unsupported-kernel probes return their unused slot.
+QEMU 时延只用于暴露挂死/崩溃及完整链路成本，不代表手机性能。没有刷机、重启手机、替换设备分配器；没有宣称所有远端运行上下文的 PTE/TLB 隔离或恶意发布者安全性已经解决。
+新的 `tests/run_v2_android.sh` 与 `tests/phone/run_v2_latency.sh` 使用常驻域，不 reset/unlink/重启/刷机；当前只做语法检查，尚未实机执行。旧 Android runner 的 fresh-domain/清理流程不作为新入口。
 
-Only full-ring backpressure (yield, then drain if still full) and close retain
-explicit drain. Normal allocation and both local/remote free are asynchronous.
-Pending free may temporarily cause acquire to return ENOMEM until a scheduling
-boundary. Kernel-backed release returns an invalid cache candidate; allocators
-must retry through the backend after completion rather than reuse it directly.
 
-## Deferred decisions
+## 2026-10-22 性能实验更新
 
-- kernel-to-broker reclaim ring, generation acknowledgement and final publish;
-- Broker permission/audit enforcement for hostile metadata writers;
-- unregister ABI for closing and reopening a backend in the same `mm`;
-- Android broker distribution and protocol version negotiation.
+最终设计以内核 DESIGN.md §2.12 为准。同核普通 FREE 发布日志后、确认仍在 owner CPU，即可直接发布空闲候选；远端及已经迁核的 FREE 等回执。获取者在 Mutex 后重查 CPU，持锁迁核本身仍允许。
+跨进程/跨 session/混合来源的自动整块清零已删除；MD_EAGER_CLEAR 自动策略已删除。显式 calloc、MD_ZERO 和调用方明确要求的清零保留语义。仍保留所有权、代际、日志与页表协议，未关闭内核桥接。
+共享 metadata/broker 协议为 v8，默认域 allocator_delegation_v8、目录 md_backend_v8；内核 ABI 为 v3。必须使用匹配的新内核，不能复用当前启动的 v7 backing。普通成功日志由内核直接回收，远端回执仍由用户态确认。
 
-## 2026-10-21 validation
-
-- Host build/UAPI checks and existing smoke tests pass.
-- Mock transport tests prove zero drain calls for normal ALLOC/local/remote FREE,
-  producer serialization, full-ring yield/fallback, sticky errors and fork close.
-- Two-process mock backend tests withhold completion: the full arena cannot be
-  reacquired before acknowledgement, and another process can obtain the same
-  zeroed address afterwards while the releaser makes no allocator calls.
-- The arm64 kernel builds successfully. QEMU runs 10 repetitions each of backend
-  local/remote asynchronous handoff, bridge context-switch/PTE isolation,
-  owner-death quarantine/error propagation, and independent-exec isolation.
-  All 40 invocations pass, without panic/oops/BUG/WARNING markers.
-- No phone boot, flash, reboot or allocator replacement was performed this time.
-
-The ABI still has no unregister. Do not close/reopen a kernel-enabled backend
-inside the same mm; tests use fresh processes per scenario. The first QEMU
-fixture hit this documented lifecycle limitation by reusing a registered ring
-VA for different backing; separating the fixture's mm lifetimes fixed it.
-No new throughput/latency claim is made; all-arena scans add scheduler work and
-need workload measurement, especially with many configured CPUs. Active-mms'
-remote PTE revocation retains the existing scheduling/task-work boundaries.
-
-## Historical device validation (2026-10-18)
-
-Validated on 2026-10-18 on a PLK110/OP60FFL1 test device using
-`fastboot boot`, without writing any boot or DLKM partition. The active-kernel
-test covers:
-
-- normal external-backend ALLOC and FREE transitions;
-- propagation of a rejected ALLOC as `EBUSY` to userspace;
-- quarantine of a page still owned when its process exits;
-- denial of a fault against the quarantined page;
-- continued allocation and release of an unrelated page.
-
-The test passed once interactively and then passed 100 consecutive stress
-iterations. No memory-delegation-related warning, oops, panic or use-after-free
-was observed. A pre-test SLUB warning came from the vendor
-`oplus_bsp_schedinfo` tick hook, outside the memory-delegation path.
-
-A separate same-CPU context-switch test uses two simultaneously live processes.
-Both processes prefault the same two free pages to establish stale PTEs, append
-ownership records without issuing an explicit DRAIN request, and then block on
-pipes to force scheduler switches. It verified in both ownership directions
-that switch-out drains the pending ALLOC, revokes the non-owner's stale PTE,
-denies the non-owner fault, and preserves the owner's access. It also verified
-that an asynchronously drained FREE makes the page faultable by the other
-process again. The test passed once interactively and then passed 100
-consecutive iterations. The denial diagnostics named two distinct live `mm`s
-and the corresponding distinct owners; no memory-delegation error, oops, or
-panic was emitted during the run.
-
-An additional unrelated-process test starts two sibling workers through
-separate `exec` calls, so neither worker is the other's parent and neither
-inherits the other's address space or delegation context. A coordinator passes
-the same memfd backing object to each worker independently using `SCM_RIGHTS`;
-each worker maps it at the shared arena address and registers its own ring. The
-same-CPU test verified asynchronous switch-out drain, stale-PTE revocation,
-same-process owner access, bidirectional non-owner denial, and post-FREE
-refault. It passed once interactively and then passed 100 consecutive
-iterations. Kernel diagnostics show each direction using distinct worker PIDs
-and `mm`s, with the peer `mm` recorded as owner.
-
-The temporary kernel still exhibits the repository's previously documented
-new-kernel/old-DLKM Wi-Fi symbol mismatch. No DLKM partition was changed for
-this test. A normal reboot changed the boot ID, preserved slot `_a`, left the
-`boot_a` SHA-256 unchanged, and the external-backend ABI probe returned to the
-unsupported-kernel fallback, confirming rollback to the persistent kernel.
-
-The device and QEMU checks above were performed with standalone validation
-harnesses that are no longer retained in this repository. The maintained
-measurement entry point is the allocator latency microbenchmark documented in
-`tests/README.md`.
+当前协议细节见内核 DESIGN.md §2.17 与 tools/testing/memory_delegation/SHARED_LOG_V3.md。本次构建未部署到手机；新二进制不能在旧 v2 内核上运行。

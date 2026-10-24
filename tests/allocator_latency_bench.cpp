@@ -1,3 +1,4 @@
+#include "../include/latency_profile.h"
 // Common latency workload for the Scudo and jemalloc delegation adapters.
 // Build once with -DMD_BENCH_SCUDO and once with -DMD_BENCH_JEMALLOC.
 
@@ -32,9 +33,20 @@ extern "C" int md_jemalloc_owns(void *Address);
 #error "define exactly one of MD_BENCH_SCUDO or MD_BENCH_JEMALLOC"
 #else
 #include "scudo_delegation.h"
+#include <malloc.h>
+extern "C" int __scudo_bench_is_primary(const void *);
+extern "C" void __scudo_bench_cache_stats(uint64_t *, uint64_t *);
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX -200
+#endif
 #endif
 
 extern "C" int md_scudo_checkpoint();
+extern "C" const char *md_cpu_query_mode() __attribute__((weak));
+
+#ifndef SCUDO_SECONDARY_STATS
+#define SCUDO_SECONDARY_STATS 1
+#endif
 
 #ifndef MD_BENCH_BUILD_ID
 #define MD_BENCH_BUILD_ID "unversioned"
@@ -54,6 +66,8 @@ struct Options {
   bool TouchPages = true;
   bool Delegated = false;
   bool ProcessMode = false;
+  bool AllowFallback = false;
+  bool CacheEnabled = true;
   std::vector<int> Cpus;
 };
 
@@ -62,6 +76,7 @@ struct Samples {
   std::vector<uint64_t> Hold;
   std::vector<uint64_t> Dealloc;
   std::vector<uint64_t> Round;
+  uint64_t Routes[8] = {}; // primary, delegated, secondary, cache calls, hits, fallback
   uint64_t Noise[4] = {}; // minor/major faults, voluntary/involuntary switches.
 };
 
@@ -120,6 +135,7 @@ uint64_t nowNs() {
 }
 
 void *allocateObject(size_t Size) {
+  { MD_SCOPE(14, EmptyProbe); }
 #if defined(MD_BENCH_JEMALLOC)
   return je_mallocx(Size, MALLOCX_ARENA(JemallocArena) | MALLOCX_TCACHE_NONE);
 #else
@@ -166,7 +182,7 @@ int runWarmup(const Options &Opt) {
     void *Pointer = allocateObject(Opt.Size);
     if (!Pointer)
       return ENOMEM;
-    if (Opt.Delegated && !isDelegatedObject(Pointer)) {
+    if (Opt.Delegated && !Opt.AllowFallback && !isDelegatedObject(Pointer)) {
       releaseObject(Pointer);
       return ENOTSUP;
     }
@@ -187,20 +203,46 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
   }
   if (LocalError) Error.store(LocalError);
   if (Start) Start->wait(Error, Opt.Delegated);
+  if (md_cpu_query_mode && !std::strncmp(md_cpu_query_mode(), "rseq_", 5))
+    Out.Routes[6] = 1;
+  else Out.Routes[7] = 1;
   rusage Before{}, After{};
   if (getrusage(RUSAGE_THREAD, &Before)) Error.store(errno);
+  uint64_t CacheCallsBefore = 0, CacheHitsBefore = 0;
+  const bool CountCache = Prepared || Opt.Cpus.size() * Opt.WorkersPerCore == 1;
+#if defined(MD_BENCH_SCUDO)
+  if (CountCache) __scudo_bench_cache_stats(&CacheCallsBefore, &CacheHitsBefore);
+#endif
+#if MD_PROFILE_STAGE
+  uint64_t ProfileValues[4096] = {};
+  mdprof::Buffer Profile{ProfileValues, 0, 4096};
+  uint64_t Empty[500] = {};
+  for (unsigned j=0;j<500;++j) { uint64_t a=mdprof::ticks(); Empty[j]=mdprof::ticks()-a; }
+  std::sort(Empty,Empty+500);
+#endif
   uint64_t Completed = 0;
   if (!Error.load()) {
     for (uint64_t I = 0; I < Opt.Iterations && !Error.load(); ++I) {
       const uint64_t T0 = nowNs();
+#if MD_PROFILE_STAGE
+      mdprof::Current = &Profile;
+#endif
       void *Pointer = allocateObject(Opt.Size);
+#if MD_PROFILE_STAGE
+      mdprof::Current = nullptr;
+#endif
       const uint64_t T1 = nowNs();
       if (!Pointer) { Error.store(ENOMEM); break; }
-      if (Opt.Delegated && !isDelegatedObject(Pointer)) {
+      if (Opt.Delegated && !Opt.AllowFallback && !isDelegatedObject(Pointer)) {
         releaseObject(Pointer);
         Error.store(ENOTSUP);
         break;
       }
+#if defined(MD_BENCH_SCUDO)
+      if (__scudo_bench_is_primary(Pointer)) ++Out.Routes[0];
+      else if (isDelegatedObject(Pointer)) ++Out.Routes[1];
+      else { ++Out.Routes[2]; if (Opt.Delegated) ++Out.Routes[5]; }
+#endif
       if (Opt.TouchPages) touchPages(Pointer, Opt.Size);
       const uint64_t T2 = nowNs();
       releaseObject(Pointer);
@@ -212,11 +254,26 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
       ++Completed;
     }
   }
+#if defined(MD_BENCH_SCUDO)
+  uint64_t CacheCallsAfter = 0, CacheHitsAfter = 0;
+  if (CountCache) __scudo_bench_cache_stats(&CacheCallsAfter, &CacheHitsAfter);
+  // The allocator counters are u32. Unsigned subtraction handles wraparound.
+  Out.Routes[3] = static_cast<uint32_t>(CacheCallsAfter - CacheCallsBefore);
+  Out.Routes[4] = static_cast<uint32_t>(CacheHitsAfter - CacheHitsBefore);
+#else
+  (void)CountCache; (void)CacheCallsBefore; (void)CacheHitsBefore;
+#endif
   if (getrusage(RUSAGE_THREAD, &After)) Error.store(errno);
   Out.Noise[0] = After.ru_minflt - Before.ru_minflt;
   Out.Noise[1] = After.ru_majflt - Before.ru_majflt;
   Out.Noise[2] = After.ru_nvcsw - Before.ru_nvcsw;
   Out.Noise[3] = After.ru_nivcsw - Before.ru_nivcsw;
+#if MD_PROFILE_STAGE
+  long double sum=0; for(uint64_t j=0;j<Profile.Count;++j) sum+=ProfileValues[j];
+  std::sort(ProfileValues,ProfileValues+Profile.Count);
+  auto q=[&](double x) {return Profile.Count? ProfileValues[uint64_t(x*(Profile.Count-1))]:0;};
+  std::printf("PROFILE stage=%d pid=%d count=%llu frequency=%llu empty_p50=%llu mean_ticks=%.4Lf p50_ticks=%llu p95_ticks=%llu p99_ticks=%llu max_ticks=%llu\n", MD_PROFILE_STAGE, getpid(), (unsigned long long)Profile.Count, (unsigned long long)mdprof::frequency(), (unsigned long long)Empty[250], Profile.Count?sum/Profile.Count:0, (unsigned long long)q(.5), (unsigned long long)q(.95), (unsigned long long)q(.99), (unsigned long long)(Profile.Count?ProfileValues[Profile.Count-1]:0));
+#endif
   // All measured workers finish before any thread performs the final drain.
   if (Finish) Finish->wait(Error, Opt.Delegated);
   Out.Alloc.resize(Completed);
@@ -254,6 +311,7 @@ bool readExact(int Fd, void *Data, size_t Size) {
 }
 
 bool sendSamples(int Fd, const Samples &Value, int Error) {
+  if (!writeExact(Fd, Value.Routes, sizeof(Value.Routes))) return false;
   if (!writeExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!writeExact(Fd, &Error, sizeof(Error)))
     return false;
@@ -269,6 +327,7 @@ bool sendSamples(int Fd, const Samples &Value, int Error) {
 }
 
 bool receiveSamples(int Fd, Samples &Value, int &Error) {
+  if (!readExact(Fd, Value.Routes, sizeof(Value.Routes))) return false;
   if (!readExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!readExact(Fd, &Error, sizeof(Error)))
     return false;
@@ -286,6 +345,7 @@ bool receiveSamples(int Fd, Samples &Value, int &Error) {
 }
 
 void appendSamples(Samples &To, Samples &&From) {
+  for (unsigned I = 0; I < 8; ++I) To.Routes[I] += From.Routes[I];
   for (unsigned I = 0; I < 4; ++I) To.Noise[I] += From.Noise[I];
   auto Append = [](std::vector<uint64_t> &Dst, std::vector<uint64_t> &Src) {
     Dst.insert(Dst.end(), std::make_move_iterator(Src.begin()),
@@ -359,6 +419,8 @@ int runProcesses(const Options &Opt, const char *SelfExe, Samples &Combined) {
             "--iterations", Iterations, "--warmup", Warmup,
             "--touch-pages", Opt.TouchPages ? "1" : "0",
             "--path", Opt.Delegated ? "delegated" : "traditional",
+            "--allow-fallback", Opt.AllowFallback ? "1" : "0",
+            "--cache", Opt.CacheEnabled ? "enabled" : "disabled",
             static_cast<char *>(nullptr));
       _exit(127);
     }
@@ -474,6 +536,8 @@ const char *humanUnit(size_t Size, double &Value) {
 void usage(const char *Argv0) {
   std::printf(
       "Usage: %s --path traditional|delegated --mode thread|process [options]\n"
+      "  --allow-fallback 0|1    allow Primary/ordinary Secondary, report actual routes\n"
+      "  --cache enabled|disabled  control ordinary Secondary cache\n"
       "  --size BYTES             one allocation size\n"
       "  --iterations N           measured rounds per worker\n"
       "  --warmup N               warmup rounds per worker\n"
@@ -487,7 +551,7 @@ void usage(const char *Argv0) {
 
 int main(int Argc, char **Argv) {
   if (Argc == 2 && !std::strcmp(Argv[1], "--build-info")) {
-    std::printf("bench_protocol=async_checkpoint_v1 build_id=%s\n", MD_BENCH_BUILD_ID);
+    std::printf("bench_protocol=shared_rings_v3 route_protocol=scudo_routes_v1 build_id=%s scudo_secondary_stats=%d\n", MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS);
     return 0;
   }
   Options Opt;
@@ -509,6 +573,13 @@ int main(int Argc, char **Argv) {
       Opt.Iterations = std::strtoull(Need(Argv[I]), nullptr, 0);
     else if (!std::strcmp(Argv[I], "--warmup"))
       Opt.Warmup = std::strtoul(Need(Argv[I]), nullptr, 0);
+    else if (!std::strcmp(Argv[I], "--allow-fallback"))
+      Opt.AllowFallback = !std::strcmp(Need(Argv[I]), "1");
+    else if (!std::strcmp(Argv[I], "--cache")) {
+      const char *Value = Need(Argv[I]);
+      if (std::strcmp(Value, "enabled") && std::strcmp(Value, "disabled")) return 2;
+      Opt.CacheEnabled = !std::strcmp(Value, "enabled");
+    }
     else if (!std::strcmp(Argv[I], "--touch-pages"))
       Opt.TouchPages = !std::strcmp(Need(Argv[I]), "1");
     else if (!std::strcmp(Argv[I], "--workers-per-core"))
@@ -541,6 +612,12 @@ int main(int Argc, char **Argv) {
     return 2;
   }
 
+#if defined(MD_BENCH_SCUDO)
+  if (!Opt.CacheEnabled && !mallopt(M_CACHE_COUNT_MAX, 0)) {
+    std::fprintf(stderr, "cannot disable Secondary cache\n");
+    return 1;
+  }
+#endif
 #if defined(MD_BENCH_JEMALLOC)
   if (Opt.Delegated && (!Opt.ProcessMode || Role != nullptr)) {
     const char *Domain = std::getenv("MEMORY_DELEGATION_DOMAIN");
@@ -600,18 +677,28 @@ int main(int Argc, char **Argv) {
   double Human = 0;
   const char *Unit = humanUnit(Opt.Size, Human);
   const unsigned Workers = Opt.Cpus.size() * Opt.WorkersPerCore;
-  std::printf("================== size=%.2f %s, threads=%u, unit=ns ==================\n",
-              Human, Unit, Workers);
+  std::printf("================== size=%.2f %s, %s=%u, unit=ns ==================\n",
+              Human, Unit, Opt.ProcessMode ? "processes" : "threads", Workers);
   std::printf("bench_config: mode=%s cores=%zu workers_per_core=%u touch_pages=%d\n",
               Opt.ProcessMode ? "process" : "thread", Opt.Cpus.size(),
               Opt.WorkersPerCore, Opt.TouchPages ? 1 : 0);
-  std::printf("bench_lifecycle: protocol=async_checkpoint_v1 warmup=%u iterations=%" PRIu64
-              " pre_checkpoint=ok post_checkpoint=ok build_id=%s\n",
-              Opt.Warmup, Opt.Iterations, MD_BENCH_BUILD_ID);
+  std::printf("bench_lifecycle: protocol=shared_rings_v3 warmup=%u iterations=%" PRIu64
+              " pre_checkpoint=ok post_checkpoint=ok build_id=%s scudo_secondary_stats=%d\n",
+              Opt.Warmup, Opt.Iterations, MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS);
   std::printf("-- %s --\n", Opt.Delegated ? "delegated" : "traditional");
   std::printf("bench_noise: worker_sum minor_faults=%" PRIu64 " major_faults=%" PRIu64
               " voluntary_cs=%" PRIu64 " involuntary_cs=%" PRIu64 "\n",
               Combined.Noise[0], Combined.Noise[1], Combined.Noise[2], Combined.Noise[3]);
+#if defined(MD_BENCH_SCUDO)
+  std::printf("bench_routes: primary=%" PRIu64 " delegated=%" PRIu64
+              " secondary=%" PRIu64 " cache_calls=%" PRIu64 " cache_hits=%" PRIu64
+              " fallback=%" PRIu64 " samples=%zu cache=%s allow_fallback=%d"
+              " rseq_workers=%" PRIu64 " fallback_cpu_workers=%" PRIu64 "\n",
+              Combined.Routes[0], Combined.Routes[1], Combined.Routes[2],
+              Combined.Routes[3], Combined.Routes[4], Combined.Routes[5],
+              Combined.Alloc.size(), Opt.CacheEnabled ? "enabled" : "disabled",
+              Opt.AllowFallback ? 1 : 0, Combined.Routes[6], Combined.Routes[7]);
+#endif
   printMetric("alloc_only", Combined.Alloc);
   printMetric("hold_only", Combined.Hold);
   printMetric("dealloc_only", Combined.Dealloc);
