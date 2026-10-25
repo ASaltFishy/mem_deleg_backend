@@ -1,4 +1,5 @@
 #include "../include/latency_profile.h"
+#include "../delegation_backend.h"
 // Common latency workload for the Scudo and jemalloc delegation adapters.
 // Build once with -DMD_BENCH_SCUDO and once with -DMD_BENCH_JEMALLOC.
 
@@ -107,11 +108,18 @@ template <class T> struct SampleAllocator {
   using value_type = T;
   SampleAllocator() noexcept = default;
   template <class U> SampleAllocator(const SampleAllocator<U> &) noexcept {}
+  [[noreturn]] static void allocationFailed() {
+#if defined(__cpp_exceptions)
+    throw std::bad_alloc();
+#else
+    std::abort();
+#endif
+  }
   T *allocate(size_t Count) {
-    if (Count > SIZE_MAX / sizeof(T)) throw std::bad_alloc();
+    if (Count > SIZE_MAX / sizeof(T)) allocationFailed();
     void *Memory = mmap(nullptr, Count * sizeof(T), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (Memory == MAP_FAILED) throw std::bad_alloc();
+    if (Memory == MAP_FAILED) allocationFailed();
     return static_cast<T *>(Memory);
   }
   void deallocate(T *Pointer, size_t Count) noexcept {
@@ -743,7 +751,7 @@ void usage(const char *Argv0) {
 
 int main(int Argc, char **Argv) {
   if (Argc == 2 && !std::strcmp(Argv[1], "--build-info")) {
-    std::printf("bench_protocol=shared_rings_v3 route_protocol=scudo_routes_v1 build_id=%s scudo_secondary_stats=%d slow_trace=%d touch_trace=%d prepare_policy=primary_checkpoint_skip_v1\n", MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS, MD_SLOW_TRACE, MD_TOUCH_TRACE);
+    std::printf("bench_protocol=shared_rings_v3 route_protocol=scudo_routes_v1 build_id=%s scudo_secondary_stats=%d slow_trace=%d touch_trace=%d prepare_policy=primary_checkpoint_skip_v1 perf_minimal=%d arena_capacity=%llu\n", MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS, MD_SLOW_TRACE, MD_TOUCH_TRACE, MD_PERF_MINIMAL, (unsigned long long)MD_DEFAULT_ARENA_CAPACITY);
     return 0;
   }
   Options Opt;
@@ -884,8 +892,9 @@ int main(int Argc, char **Argv) {
               Opt.ProcessMode ? "process" : "thread", Opt.Cpus.size(),
               Opt.WorkersPerCore, Opt.TouchPages ? 1 : 0);
   std::printf("bench_lifecycle: protocol=shared_rings_v3 warmup=%u iterations=%" PRIu64
-              " pre_checkpoint=ok post_checkpoint=ok build_id=%s scudo_secondary_stats=%d\n",
-              Opt.Warmup, Opt.Iterations, MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS);
+              " pre_checkpoint=ok post_checkpoint=ok build_id=%s scudo_secondary_stats=%d perf_minimal=%d arena_capacity=%llu\n",
+              Opt.Warmup, Opt.Iterations, MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS,
+              MD_PERF_MINIMAL, (unsigned long long)MD_DEFAULT_ARENA_CAPACITY);
   std::printf("-- %s --\n", Opt.Delegated ? "delegated" : "traditional");
   std::printf("bench_noise: worker_sum minor_faults=%" PRIu64 " major_faults=%" PRIu64
               " voluntary_cs=%" PRIu64 " involuntary_cs=%" PRIu64 "\n",

@@ -51,7 +51,8 @@ int main(int Argc, char **Argv) {
       std::free(Pointers[I]);
     }
     if (md_scudo_checkpoint()) ++Failures;
-    if (ExpectExhaustion ? (NoMemory == 0 || Delegated + NoMemory != 4) : Delegated != 4)
+    const bool CapacityLimited = ExpectExhaustion || Size * 4 >= MD_DEFAULT_ARENA_CAPACITY;
+    if (CapacityLimited ? (NoMemory == 0 || Delegated + NoMemory != 4) : Delegated != 4)
       ++Failures;
     std::printf("CAPACITY_CASE size=%zu delegated=%u enomem=%u\n", Size, Delegated, NoMemory);
   }

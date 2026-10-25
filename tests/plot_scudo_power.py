@@ -31,6 +31,7 @@ def parse_log(text):
             if 'pre_checkpoint=ok post_checkpoint=ok' not in line:
                 raise ValueError('checkpoint failed')
             current['checkpoint_ok'] = 1
+            current.update({key: int(value) for key, value in re.findall(r'(perf_minimal|arena_capacity)=(\d+)', line)})
         elif current is not None and re.match(r'\s*(alloc_only|dealloc_only|hold_only|all)\s+mean=', line):
             stage = re.match(r'\s*(\w+)', line)[1]
             prefix = {'alloc_only': 'alloc', 'dealloc_only': 'free', 'hold_only': 'hold', 'all': 'all'}[stage]

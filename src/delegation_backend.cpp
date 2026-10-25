@@ -335,15 +335,17 @@ static uint64_t nowNs() {
 
 static void lock(SharedMetadata *Metadata) {
   if (pthread_mutex_trylock(&Metadata->ArenaMutex) == 0) {
-    ++Metadata->LockAcquisitions;
+    MD_STAT(++Metadata->LockAcquisitions);
     return;
   }
+#if !MD_PERF_MINIMAL
   uint64_t Start = nowNs();
+#endif
   int Error = pthread_mutex_lock(&Metadata->ArenaMutex);
   if (Error) abort();
-  ++Metadata->LockAcquisitions;
-  ++Metadata->LockContentions;
-  Metadata->LockWaitNs += nowNs() - Start;
+  MD_STAT(++Metadata->LockAcquisitions);
+  MD_STAT(++Metadata->LockContentions);
+  MD_STAT(Metadata->LockWaitNs += nowNs() - Start);
 }
 
 static void unlock(SharedMetadata *Metadata) {
@@ -363,7 +365,7 @@ static uint32_t allocateDescriptor(SharedMetadata *Metadata) {
     Metadata->DescriptorHead = Metadata->Runs[Index].Next;
   }
   Metadata->Runs[Index].State.store(Claiming, md_atomic::memory_order_relaxed);
-  ++Metadata->DescriptorPops;
+  MD_STAT(++Metadata->DescriptorPops);
   return Index;
 }
 
@@ -412,13 +414,13 @@ static void linkAddress(SharedMetadata *Metadata, uint32_t Index) {
   if (Hint != kNoIndex && Metadata->Runs[Hint].StartPage < Run.StartPage) {
     Prev = Hint;
     Next = Metadata->Runs[Hint].Next;
-    ++Metadata->HintHits;
+    MD_STAT(++Metadata->HintHits);
   }
   while (Next != kNoIndex &&
          Metadata->Runs[Next].StartPage < Run.StartPage) {
     Prev = Next;
     Next = Metadata->Runs[Next].Next;
-    ++Metadata->AddressSteps;
+    MD_STAT(++Metadata->AddressSteps);
   }
   Run.Prev = Prev;
   Run.Next = Next;
@@ -497,7 +499,7 @@ static uint32_t mergeFreeRun(SharedMetadata *Metadata, uint32_t Index) {
       PrevRun.Generation.incrementLocked();
       retireRun(Metadata, Index);
       linkBin(Metadata, Prev);
-      Metadata->MergeCount.incrementLocked();
+      MD_STAT(Metadata->MergeCount.incrementLocked());
       Index = Prev;
       Run = &Metadata->Runs[Index];
     }
@@ -514,7 +516,7 @@ static uint32_t mergeFreeRun(SharedMetadata *Metadata, uint32_t Index) {
       Run->Generation.incrementLocked();
       retireRun(Metadata, Next);
       linkBin(Metadata, Index);
-      Metadata->MergeCount.incrementLocked();
+      MD_STAT(Metadata->MergeCount.incrementLocked());
     }
   }
   return Index;
@@ -590,13 +592,13 @@ static __attribute__((noinline)) int claimRun(ArenaImpl *Backend, uint32_t Index
     makeFree(Metadata, Prefix, OriginalStart, PrefixPages);
     Metadata->Runs[Prefix].LastSession = LastSession;
     Metadata->Runs[Prefix].LastOwner = LastOwner;
-    Metadata->SplitCount.incrementLocked();
+    MD_STAT(Metadata->SplitCount.incrementLocked());
   }
   if (Suffix != kNoIndex) {
     makeFree(Metadata, Suffix, SuffixStart, SuffixPages);
     Metadata->Runs[Suffix].LastSession = LastSession;
     Metadata->Runs[Suffix].LastOwner = LastOwner;
-    Metadata->SplitCount.incrementLocked();
+    MD_STAT(Metadata->SplitCount.incrementLocked());
   }
   Run.StartPage = StartPage;
   Run.Pages = NeededPages;
@@ -617,8 +619,7 @@ static __attribute__((noinline, cold)) int rollbackAcquireLocked(
   linkAddress(Metadata, Lease.block_id);
   linkBin(Metadata, Lease.block_id);
   mergeFreeRun(Metadata, Lease.block_id);
-  Metadata->AcquireSuccesses.store(Metadata->AcquireSuccesses.load(__ATOMIC_RELAXED) - 1,
-                                   __ATOMIC_RELAXED);
+  MD_STAT(Metadata->AcquireSuccesses.store(Metadata->AcquireSuccesses.load(__ATOMIC_RELAXED) - 1, __ATOMIC_RELAXED));
   unlock(Metadata);
   return Error;
 }
@@ -776,7 +777,7 @@ static void drainLocked(SharedMetadata *Metadata, bool OwnerValidated = false) {
       *Link = Run.Next;
       Run.ReleaseTicket.store(0, __ATOMIC_RELAXED);
       publishLocked(Metadata, Index);
-      Metadata->ReleaseSuccesses.incrementLocked();
+      MD_STAT(Metadata->ReleaseSuccesses.incrementLocked());
     }
   }
 
@@ -827,9 +828,9 @@ static void drainLocked(SharedMetadata *Metadata, bool OwnerValidated = false) {
       }
       Run.ReleaseTicket.store(0, __ATOMIC_RELAXED);
       publishLocked(Metadata, Index);
-      ++Metadata->RemoteDrained;
-      Metadata->ReleaseCalls.incrementLocked();
-      Metadata->ReleaseSuccesses.incrementLocked();
+      MD_STAT(++Metadata->RemoteDrained);
+      MD_STAT(Metadata->ReleaseCalls.incrementLocked());
+      MD_STAT(Metadata->ReleaseSuccesses.incrementLocked());
     }
   }
   if (Metadata->KernelEnabled == 2)
@@ -1195,7 +1196,7 @@ static __attribute__((noinline)) int acquireBumpLocked(
   Out->address = reinterpret_cast<uintptr_t>(Impl.Payload) +
                  static_cast<uintptr_t>(StartPage) * Impl.PageSize;
   Out->size = static_cast<size_t>(NeededPages) * Impl.PageSize;
-  Metadata->AcquireSuccesses.incrementLocked();
+  MD_STAT(Metadata->AcquireSuccesses.incrementLocked());
   return 0;
 }
 
@@ -1217,7 +1218,7 @@ static __attribute__((noinline)) int acquireLocal(md_arena_view *Backend, size_t
 #ifdef MD_TEST_MIGRATION
   md_test_metadata_locked();
 #endif
-  Metadata->AcquireCalls.incrementLocked();
+  MD_STAT(Metadata->AcquireCalls.incrementLocked());
   uint32_t StartClass = sizeClass(NeededPages);
   for (uint32_t Class = StartClass; Class < kNumBins; ++Class) {
     for (uint32_t Index = Metadata->BinHeads[Class]; Index != kNoIndex;
@@ -1238,7 +1239,7 @@ static __attribute__((noinline)) int acquireLocal(md_arena_view *Backend, size_t
         Result = claimRun(&Impl, Index, StartPage, NeededPages, Owner, Out);
       }
       if (Result == 0) {
-        Metadata->AcquireSuccesses.incrementLocked();
+        MD_STAT(Metadata->AcquireSuccesses.incrementLocked());
         MD_STOP(CandidateProbe);
         return finishAcquireLocked(Impl, *Out, Flags);
       }
@@ -1267,7 +1268,7 @@ static int tryAcquireLocal(md_arena_view *Backend, md_candidate Candidate,
 #ifdef MD_TEST_MIGRATION
   md_test_metadata_locked();
 #endif
-  Metadata->AcquireCalls.incrementLocked();
+  MD_STAT(Metadata->AcquireCalls.incrementLocked());
   RunDescriptor &Run = Metadata->Runs[Candidate.block_id];
   if (Run.State.load(md_atomic::memory_order_relaxed) != Free ||
       Run.Generation.load(md_atomic::memory_order_acquire) != Candidate.generation) {
@@ -1286,7 +1287,7 @@ static int tryAcquireLocal(md_arena_view *Backend, md_candidate Candidate,
   Out->address = reinterpret_cast<uintptr_t>(Backend->Impl.Payload) +
                  static_cast<uintptr_t>(Run.StartPage) * Backend->Impl.PageSize;
   Out->size = static_cast<size_t>(Run.Pages) * Backend->Impl.PageSize;
-  Metadata->AcquireSuccesses.incrementLocked();
+  MD_STAT(Metadata->AcquireSuccesses.incrementLocked());
   return finishAcquireLocked(Backend->Impl, *Out, 0);
 }
 
@@ -1333,13 +1334,13 @@ static int releaseLocal(md_arena_view *Backend, const md_lease *Lease,
       Run.ReleaseTicket.store(Lease->generation, __ATOMIC_RELAXED);
       unlock(Metadata); return Error;
     }
-    Metadata->ReleaseCalls.incrementLocked();
+    MD_STAT(Metadata->ReleaseCalls.incrementLocked());
     // Check AFTER publishing the log. If we migrate after this check, the
     // owner CPU's schedule-out observes this FREE before another mm can run.
     // A holder that has already migrated must keep Pending until its receipt.
     if (currentCpuFast() == static_cast<int>(Metadata->ArenaId)) {
       uint32_t ResultIndex = publishLocked(Metadata, Lease->block_id);
-      Metadata->ReleaseSuccesses.incrementLocked();
+      MD_STAT(Metadata->ReleaseSuccesses.incrementLocked());
       if (OutCandidate) *OutCandidate = {ResultIndex,
           Metadata->Runs[ResultIndex].Generation.load(__ATOMIC_RELAXED)};
     } else {
@@ -1355,8 +1356,8 @@ static int releaseLocal(md_arena_view *Backend, const md_lease *Lease,
   Run.LastSession = ClearPayload ? 0 : Run.HolderSession;
   Run.ReleaseTicket.store(0, __ATOMIC_RELAXED);
   uint32_t ResultIndex = publishLocked(Metadata, Lease->block_id);
-  Metadata->ReleaseCalls.incrementLocked();
-  Metadata->ReleaseSuccesses.incrementLocked();
+  MD_STAT(Metadata->ReleaseCalls.incrementLocked());
+  MD_STAT(Metadata->ReleaseSuccesses.incrementLocked());
   if (OutCandidate) *OutCandidate = {ResultIndex,
       Metadata->Runs[ResultIndex].Generation.load(__ATOMIC_RELAXED)};
   unlock(Metadata);
@@ -1490,10 +1491,13 @@ extern "C" int md_acquire_flags(md_backend *Backend, size_t Size, size_t Alignme
                                  uint32_t Owner, unsigned Flags, md_lease *Out) {
   MD_SCOPE(1, BackendProbe);
   MD_SCOPE(2, RouteProbe);
-  if (!Backend || !Out || !Size || Size > Backend->Impl.Capacity ||
-      Alignment > Backend->Impl.Capacity ||
+  if (!Backend || !Out || !Size ||
       (Alignment && (Alignment & (Alignment - 1))) || Owner == kNoOwner ||
       (Flags & ~static_cast<unsigned>(MD_ZERO))) return EINVAL;
+  // Valid requests that cannot fit the configured pool are resource exhaustion,
+  // not malformed arguments. The allocator adapter may use its native backend.
+  if (Size > Backend->Impl.Capacity || Alignment > Backend->Impl.Capacity)
+    return ENOMEM;
   int BridgeError = refreshKernelBridgesAfterFork(Backend);
   if (BridgeError) return BridgeError;
   for (;;) {

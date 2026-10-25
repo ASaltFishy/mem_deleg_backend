@@ -1,5 +1,11 @@
 # Unified memory-delegation backend
 
+Current development after `md-milestone-20261025` uses **256 MiB per CPU Arena**
+and capacity-driven native fallback. The tag retains the earlier 2 GiB research
+snapshot and its phone evidence. See `tests/README.md` for `PERF_MINIMAL=1`,
+progress output, actual route counts and the required fresh-boot transition.
+
+
 最终设计以 `/home/lrc/patent/kernel/kernel_platform/common/DESIGN.md` 为准。
 本次实现共享元数据版本 7、内核双 ring ABI v2；旧版域必须停用，使用新域。
 

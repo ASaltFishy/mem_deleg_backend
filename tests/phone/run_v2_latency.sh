@@ -10,6 +10,15 @@ PRIMARY_ITERATIONS=${13:-10000}; PRIMARY_WARMUP=${14:-1000}; ORDER_OFFSET=${15:-
 ALLOCATORS=${16:-scudo,jemalloc}
 SIZE_SWEEP=${17:-default}
 THREAD_COUNTS=${18:-1,2,4,8}
+PERF_MINIMAL=${19:-0}
+case "$PERF_MINIMAL" in 0|1) ;; *) echo 'Invalid PERF_MINIMAL' >&2; exit 2;; esac
+stats_node=/sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
+saved_kernel_stats=
+restore_kernel_stats() {
+  if [ -n "$saved_kernel_stats" ]; then echo "$saved_kernel_stats" > "$stats_node"; fi
+}
+trap restore_kernel_stats EXIT
+trap 'exit 130' INT TERM
 case ",$THREAD_COUNTS," in *,,*|*[!1248,]*) echo 'Invalid THREAD_COUNTS' >&2; exit 2;; esac
 thread_counts=$(printf '%s' "$THREAD_COUNTS" | tr ',' ' ')
 for threads in $thread_counts; do
@@ -34,10 +43,29 @@ export SCUDO_SHARED_ARENA_DISABLE=1
 echo "BACKEND_POLICY local_free=immediate remote_free=receipt auto_clear=off explicit_zero=on"
 echo "ROUTE_POLICY allow_fallback=$ALLOW_FALLBACK"
 echo "MEASUREMENT_POLICY order=balanced_six offset=$ORDER_OFFSET primary_iterations_min=$PRIMARY_ITERATIONS primary_warmup_min=$PRIMARY_WARMUP"
-printf '\nCONFIG allocator=scudo matrix=%s cpu=%s warmup=%s iterations=%s repetitions=%s\n' "$MATRIX" "$CPUS" "$WARMUP" "$ITERATIONS" "$REPETITIONS"
+printf '\nCONFIG allocators=%s matrix=%s cpu=%s warmup=%s iterations=%s repetitions=%s perf_minimal=%s arena_bytes=268435456\n' "$ALLOCATORS" "$MATRIX" "$CPUS" "$WARMUP" "$ITERATIONS" "$REPETITIONS" "$PERF_MINIMAL"
 if [ "$PLAN_ONLY" != 1 ]; then
   # Read-only ABI probe, before creating backing or starting any benchmark.
   "$DIR/memory_delegation_backend_broker.aarch64" --check-kernel || exit 1
+fi
+if [ "$PLAN_ONLY" != 1 ]; then
+  selected_allocators=$allocator_list
+  [ "$MATRIX" != power ] || selected_allocators=scudo
+  for selected in $selected_allocators; do
+    info=$("$DIR/allocator_latency_$selected.aarch64" --build-info)
+    echo "$info" | grep -q "perf_minimal=$PERF_MINIMAL arena_capacity=268435456" || {
+      echo 'Rebuild benchmark: PERF_MINIMAL/256 MiB Arena build does not match requested run' >&2; exit 2;
+    }
+  done
+  if [ "$PERF_MINIMAL" = 1 ]; then
+    if [ -f "$stats_node" ]; then
+      saved_kernel_stats=$(cat "$stats_node")
+      echo 0 > "$stats_node"
+      echo 'KERNEL_STATS_POLICY enabled=off restore_on_exit=1'
+    else
+      echo 'KERNEL_STATS_POLICY node=unavailable unchanged=1'
+    fi
+  fi
 fi
 if [ "$PLAN_ONLY" != 1 ] && [ ! -S "$SOCKET" ]; then
   nohup "$DIR/memory_delegation_backend_broker.aarch64" "$SOCKET" "$DOMAIN" > "$DIR/broker.log" 2>&1 &
@@ -125,6 +153,11 @@ else
     done
     echo "SIZE_SWEEP power min_exp=$MIN_EXP max_exp=$MAX_EXP unit=KiB"
   fi
+  total=0; index=0
+  for a in $allocator_list; do for size in $sizes; do for mode in $modes; do for touch in $touches; do for workers in $worker_counts; do
+    total=$((total+2*REPETITIONS))
+  done; done; done; done; done
+  echo "MATRIX_TOTAL groups=$total"
   for allocator in $allocator_list; do
     if [ "$PLAN_ONLY" != 1 ]; then "$DIR/allocator_latency_$allocator.aarch64" --build-info | grep -q bench_protocol=shared_rings_v3; fi
     for size in $sizes; do for mode in $modes; do for touch in $touches; do for workers in $worker_counts; do
@@ -140,10 +173,19 @@ else
         if [ $(((repetition+workers)%2)) -eq 1 ]; then paths="delegated traditional"; fi
         for path in $paths; do
           if [ "$path" = delegated ]; then export SCUDO_DELEGATION_BACKEND=1; else export SCUDO_DELEGATION_BACKEND=0; fi
-          echo "V2_PHONE_CASE allocator=$allocator size=$size mode=$mode touch=$touch workers_per_core=$workers path=$path repetition=$repetition"
+          index=$((index+1))
+          printf '\n[%03d/%03d] %s | %s KiB | %s | %s workers/CPU | touch=%s | %s | repeat %s/%s\n' \
+            "$index" "$total" "$allocator" "$((size/1024))" "$mode" "$workers" "$touch" "$path" "$repetition" "$REPETITIONS"
+          echo "V2_PHONE_CASE index=$index total=$total allocator=$allocator size=$size mode=$mode touch=$touch workers_per_core=$workers path=$path repetition=$repetition"
           if [ "$PLAN_ONLY" != 1 ]; then
-            "$DIR/allocator_latency_$allocator.aarch64" --size "$size" --mode "$mode" --cpus "$CPUS" \
-              --workers-per-core "$workers" --path "$path" --allow-fallback "$ALLOW_FALLBACK" --touch-pages "$touch" --iterations "$case_iterations" --warmup "$case_warmup"
+            if "$DIR/allocator_latency_$allocator.aarch64" --size "$size" --mode "$mode" --cpus "$CPUS" \
+              --workers-per-core "$workers" --path "$path" --allow-fallback "$ALLOW_FALLBACK" --touch-pages "$touch" --iterations "$case_iterations" --warmup "$case_warmup"; then
+              echo "V2_PHONE_CASE_PASS index=$index"
+            else
+              error=$?
+              echo "V2_PHONE_CASE_FAIL index=$index exit=$error" >&2
+              exit "$error"
+            fi
           fi
         done
         repetition=$((repetition+1))

@@ -220,7 +220,7 @@ def prepare_device(args, binaries, cpu, execution_modes):
                 raise RuntimeError(f"异步内核探测异常终止，保留 domain={domain}: {result.stderr}")
             cleanup_domain(args, domain)
             if result.returncode or "pre_checkpoint=ok post_checkpoint=ok" not in result.stdout:
-                raise RuntimeError(f"{allocator} 异步内核探测失败，请检查内核 ABI / Arena 配置（新后端每核为 2 GiB；需要支持该上限的新内核，且不能与旧尺寸 Arena 混用）；domain={domain}\n{result.stderr}")
+                raise RuntimeError(f"{allocator} 异步内核探测失败，请检查内核 ABI / Arena 配置（新后端每核为 256 MiB；需要支持该上限的新内核，且不能与旧尺寸 Arena 混用）；domain={domain}\n{result.stderr}")
 
 
 
@@ -390,8 +390,7 @@ def run_matrix(args):
     worker_counts = split_csv(args.workers_per_core, int)
     touch_modes = split_csv(args.touch_page_modes, int)
     sizes = split_csv(args.sizes, int)
-    if "delegated" in paths and any(size * max(worker_counts) >= 2 * 1024 * 1024 * 1024 for size in sizes):
-        raise RuntimeError("delegated 单 arena 为 2 GiB；size × 每核 worker 数须小于容量（还需预留 allocator 元数据）")
+    # Capacity exhaustion is part of the workload; let native fallback run.
     if set(touch_modes) - {0, 1} or any(value < 1 for value in worker_counts):
         raise RuntimeError("touch 只能为 0/1，workers-per-core 必须大于 0")
 

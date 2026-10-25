@@ -1,5 +1,6 @@
 #ifndef MD_LATENCY_PROFILE_H
 #define MD_LATENCY_PROFILE_H
+#include "perf_config.h"
 #ifndef MD_PROFILE_STAGE
 #define MD_PROFILE_STAGE 0
 #endif

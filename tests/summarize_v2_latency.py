@@ -16,12 +16,20 @@ def parse(text):
         required += [metric + '_mean_ns' for metric in ('alloc_only', 'hold_only', 'dealloc_only', 'all')]
         if any(key not in current for key in required):
             raise ValueError('Incomplete case: ' + str(current))
+        if 'index' in current and not current.get('case_pass'):
+            raise ValueError('Case has no PASS marker')
         rows.append(current.copy())
 
     for line in text.splitlines():
         if line.startswith('V2_PHONE_CASE '):
             finish()
             current = dict(re.findall(r'(\w+)=(\S+)', line))
+        elif line.startswith('V2_PHONE_CASE_FAIL '):
+            raise ValueError(line)
+        elif line.startswith('V2_PHONE_CASE_PASS '):
+            if current is None or int(line.split('index=')[1]) != int(current['index']):
+                raise ValueError('Mismatched case PASS index')
+            current['case_pass'] = 1
         elif current is not None and line.startswith('bench_jemalloc_routes: '):
             current.update({'route_' + key: int(value) for key, value in
                             re.findall(r'\b(delegated|ordinary|fallback|samples)=(\d+)', line)})
@@ -37,7 +45,7 @@ def parse(text):
         elif current is not None and line.startswith('bench_lifecycle: '):
             if 'pre_checkpoint=ok post_checkpoint=ok' not in line:
                 raise ValueError('Checkpoint failed')
-            current.update(dict(re.findall(r'(warmup|iterations|build_id)=([^\s]+)', line)))
+            current.update(dict(re.findall(r'(warmup|iterations|build_id|perf_minimal|arena_capacity)=([^\s]+)', line)))
         elif current is not None and line.startswith('bench_config: '):
             current.update({key: int(value) for key, value in
                             re.findall(r'(cores|workers_per_core|touch_pages)=(\d+)', line)})
@@ -51,6 +59,9 @@ def parse(text):
     finish()
     if not rows or 'V2_PHONE_ALL_PASS' not in text:
         raise ValueError('No complete successful sweep')
+    if 'total' in rows[0]:
+        if len(rows) != int(rows[0]['total']) or [int(row['index']) for row in rows] != list(range(1, len(rows)+1)):
+            raise ValueError('Matrix progress indices are incomplete')
     return rows
 
 

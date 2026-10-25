@@ -9,9 +9,12 @@ mkdir -p "$stage/include" "$work/objects"
 cp "$scudo"/*.h "$scudo"/*.cpp "$scudo"/*.inc "$scudo"/*.def "$stage/"
 cp -R "$scudo/include/." "$stage/include/"
 cp "$root/adapters/scudo_delegation.cpp" "$root/adapters/scudo_delegation.h" "$stage/"
+perf_minimal=${PERF_MINIMAL:-0}
+[[ "$perf_minimal" == 0 || "$perf_minimal" == 1 ]] || exit 2
 secondary_stats=${SCUDO_SECONDARY_STATS:-0}
+[[ "$perf_minimal" == 0 ]] || secondary_stats=0
 [[ "$secondary_stats" == 0 || "$secondary_stats" == 1 ]] || exit 2
-common=(-DSCUDO_SECONDARY_STATS="$secondary_stats" -std=c++17 -O2 -g -DNDEBUG -pthread -fno-exceptions -fno-rtti -I"$stage" -I"$stage/include" -I"$root")
+common=(-DMD_PERF_MINIMAL="$perf_minimal" -DSCUDO_SECONDARY_STATS="$secondary_stats" -std=c++17 -O2 -g -DNDEBUG -pthread -fno-exceptions -fno-rtti -I"$stage" -I"$stage/include" -I"$root")
 sources=(checksum common condition_variable_linux crc32_hw flags_parser flags
          fuchsia linux mem_map mem_map_fuchsia mem_map_linux release report report_linux
          shared_arena_linux scudo_delegation string_utils timing wrappers_c wrappers_cpp)

@@ -316,3 +316,19 @@ power 入口和 quick/full 入口现在都在成功结束后自动生成 malloc�
 hold 为原 benchmark 的 touch/use 与辅助检查区间；all 为 malloc+hold+free 的墙钟测量区间，排除预热与 checkpoint。脚本只重新读取日志和绘图，无需重建二进制或重跑设备测试。
 
 旧 quick/full 数据可用 python3 tests/summarize_v2_latency.py --log RESULTS/run.log --output-dir RESULTS 补画。旧 Scudo power 数据可用 python3 tests/plot_scudo_power.py --log RESULTS/run.log --output-dir RESULTS 补画。
+
+
+### 里程碑之后：256 MiB 容量、进度与性能构建（2026-10-25）
+
+`md-milestone-20261025` 保留此前 2 GiB 源码和既有真机结果，以下修改不属于该 tag 的验证结论。
+
+- 每 CPU Arena 默认 payload 容量改为 256 MiB。没有人为的“请求 >=256 MiB 强制 baseline”分支；后端按照实际剩余空间、连续块、对齐/headers 和并发 live 占用判断。有效请求超过总容量或当前无法取得块时返回 ENOMEM，适配器继续走原分配器的缓存/mmap 等路径。低于 256 MiB 也可能因为空间不足回退。ALLOCATION 的 generation/session、日志提交、清零请求及仲裁检查不受性能开关影响。
+- quick/full/threads 入口显示 [index/total] 和 workload 信息，并记录 PASS/FAIL。原始 CSV 保存 index/total 与完成标记，解析时验证序列完整。
+- 构建和运行均指定 PERF_MINIMAL=1：编译移除 Backend 的普通性能计数更新、锁等待计时，以及 profile/slow/touch trace 和 Scudo Secondary 附加统计。保留真实路线计数、worker 上下文切换统计、故障回执及全部必要安全检查。路线分类仍位于 alloc 计时区间之后，属于 hold 的辅助工作；因此并非声称测量完全没有观测开销。PERF_MINIMAL=0 保留诊断计数；两类构建的标签与 manifest 分开记录，runner 拒绝参数与二进制不匹配。
+- 性能运行时若 debugfs 的 switch_cycle_stats_enabled 可用，会暂时关闭内核周期统计并在脚本退出时恢复；无节点则如实报告 unavailable，不声称已更改内核配置。
+- 使用独立 c256m domain/每 boot 目录，禁止在已注册的旧 2 GiB backing 上原地 reset。已有 2 GiB Arena 的手机需要用户先手动重启一次，再运行新配置；当前支持 2 GiB 上限的 ABI v3 内核可注册较小的 256 MiB Arena，无需仅为此重新刷机。
+- 图表保留真实 fallback 比例，不把回退数据强制替换成 baseline 数值。内存驻留、缓存状态和调度均可能使相同原始路径的实测值不同。
+
+构建示例：`PERF_MINIMAL=1 bash tests/build_android_latency_bench.sh`。
+运行示例：`PERF_MINIMAL=1 ALLOCATORS=jemalloc MATRIX=threads SIZE_SWEEP=power THREAD_COUNTS=1,2,4,8 MIN_EXP=4 MAX_EXP=18 ALLOW_FALLBACK=1 CPUS=0 WARMUP=10 ITERATIONS=30 REPETITIONS=5 PRIMARY_WARMUP=1000 PRIMARY_ITERATIONS=10000 bash tests/run_phone_v3_tests.sh`。
+MAX_EXP=18 包含 256 MiB 观察点；17 保留之前 128 MiB 上限。两者都不重写分配路径。
