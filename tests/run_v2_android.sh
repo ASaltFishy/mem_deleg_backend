@@ -22,21 +22,27 @@ primary_warmup=${PRIMARY_WARMUP:-1000}
 order_offset=${ORDER_OFFSET:-0}
 size_sweep=${SIZE_SWEEP:-default}
 thread_counts=${THREAD_COUNTS:-1,2,4,8}
+process_counts=${PROCESS_COUNTS:-1,2,4,8}
 perf_minimal=${PERF_MINIMAL:-0}
 [[ "$perf_minimal" == 0 || "$perf_minimal" == 1 ]] || { echo 'PERF_MINIMAL must be 0 or 1' >&2; exit 2; }
 [[ "$thread_counts" =~ ^(1|2|4|8)(,(1|2|4|8))*$ ]] || { echo 'THREAD_COUNTS must list 1,2,4,8' >&2; exit 2; }
+[[ "$process_counts" =~ ^(1|2|4|8)(,(1|2|4|8))*$ ]] || { echo 'PROCESS_COUNTS must list 1,2,4,8' >&2; exit 2; }
 case "$size_sweep" in default|power) ;; *) echo 'SIZE_SWEEP must be default or power' >&2; exit 2;; esac
 [[ "$primary_iterations" =~ ^[1-9][0-9]*$ && "$primary_warmup" =~ ^[1-9][0-9]*$ ]]
 [[ "$order_offset" =~ ^[0-5]$ ]] || { echo 'ORDER_OFFSET must be 0..5' >&2; exit 2; }
 [[ "$allow_fallback" == 0 || "$allow_fallback" == 1 ]] || { echo 'ALLOW_FALLBACK must be 0 or 1' >&2; exit 2; }
-[[ "$matrix" == power || "$matrix" == quick || "$matrix" == full || "$matrix" == threads ]]
+[[ "$matrix" == power || "$matrix" == quick || "$matrix" == full || "$matrix" == threads || "$matrix" == processes ]]
 for value in "$iterations" "$warmup" "$repetitions"; do [[ "$value" =~ ^[1-9][0-9]*$ ]]; done
-[[ "$min_exp" =~ ^[0-9]+$ && "$max_exp" =~ ^[0-9]+$ ]]
-((min_exp >= 4 && min_exp <= max_exp && max_exp <= 18))
+[[ "$min_exp" =~ ^[0-9]+$ && "$max_exp" =~ ^[0-9]+$ ]] || {
+  echo 'MIN_EXP and MAX_EXP must be integers (KiB exponents)' >&2; exit 2;
+}
+((min_exp >= 4 && min_exp <= max_exp && max_exp <= 19)) || {
+  echo 'Size range must satisfy 4 <= MIN_EXP <= MAX_EXP <= 19 (16 KiB .. 512 MiB)' >&2; exit 2;
+}
 [[ "$domain" =~ ^[A-Za-z0-9_-]+$ && "$phone_dir" =~ ^/[A-Za-z0-9_/-]+$ && "$cpus" =~ ^[0-9]+(,[0-9]+)*$ ]]
 if [[ "$matrix" == power && "$cpus" == *,* ]]; then echo 'power requires a single CPU ID' >&2; exit 2; fi
 if [[ "${1:-}" == --dry-run ]]; then
-  exec sh "$root/tests/phone/run_v2_latency.sh" /unused "$domain" /unused.sock "$cpus" "$matrix" "$iterations" "$warmup" "$repetitions" 1 "$min_exp" "$max_exp" "$allow_fallback" "$primary_iterations" "$primary_warmup" "$order_offset" "$allocators" "$size_sweep" "$thread_counts" "$perf_minimal"
+  exec sh "$root/tests/phone/run_v2_latency.sh" /unused "$domain" /unused.sock "$cpus" "$matrix" "$iterations" "$warmup" "$repetitions" 1 "$min_exp" "$max_exp" "$allow_fallback" "$primary_iterations" "$primary_warmup" "$order_offset" "$allocators" "$size_sweep" "$thread_counts" "$perf_minimal" "$process_counts"
 fi
 [[ $# == 0 ]] || { echo 'Only --dry-run is supported; configure via environment.' >&2; exit 2; }
 results_dir=${RESULTS_DIR:-$root/work/scudo-power-$(date +%Y%m%d-%H%M%S)}
@@ -84,7 +90,7 @@ if [[ "${USE_SU:-0}" == 1 ]]; then
 else
   "$adb_bin" "${adb_args[@]}" shell chmod 755 "$bin_dir/"'*'
 fi
-args="$bin_dir/run_v2_latency.sh $bin_dir $domain $phone_dir/backend.sock $cpus $matrix $iterations $warmup $repetitions 0 $min_exp $max_exp $allow_fallback $primary_iterations $primary_warmup $order_offset $allocators $size_sweep $thread_counts $perf_minimal"
+args="$bin_dir/run_v2_latency.sh $bin_dir $domain $phone_dir/backend.sock $cpus $matrix $iterations $warmup $repetitions 0 $min_exp $max_exp $allow_fallback $primary_iterations $primary_warmup $order_offset $allocators $size_sweep $thread_counts $perf_minimal $process_counts"
 if [[ "${USE_SU:-0}" == 1 ]]; then
   "$adb_bin" "${adb_args[@]}" shell su -c "sh $args" 2>&1 | tee "$log"
 else

@@ -11,6 +11,7 @@ ALLOCATORS=${16:-scudo,jemalloc}
 SIZE_SWEEP=${17:-default}
 THREAD_COUNTS=${18:-1,2,4,8}
 PERF_MINIMAL=${19:-0}
+PROCESS_COUNTS=${20:-1,2,4,8}
 case "$PERF_MINIMAL" in 0|1) ;; *) echo 'Invalid PERF_MINIMAL' >&2; exit 2;; esac
 stats_node=/sys/kernel/debug/memory_delegation/switch_cycle_stats_enabled
 saved_kernel_stats=
@@ -24,17 +25,26 @@ thread_counts=$(printf '%s' "$THREAD_COUNTS" | tr ',' ' ')
 for threads in $thread_counts; do
   case "$threads" in 1|2|4|8) ;; *) echo 'Invalid thread count' >&2; exit 2;; esac
 done
+case ",$PROCESS_COUNTS," in *,,*|*[!1248,]*) echo 'Invalid PROCESS_COUNTS' >&2; exit 2;; esac
+process_counts=$(printf '%s' "$PROCESS_COUNTS" | tr ',' ' ')
+for processes in $process_counts; do
+  case "$processes" in 1|2|4|8) ;; *) echo 'Invalid process count' >&2; exit 2;; esac
+done
 case "$SIZE_SWEEP" in default|power) ;; *) echo 'Invalid SIZE_SWEEP' >&2; exit 2;; esac
 case "$ALLOCATORS" in scudo|jemalloc|scudo,jemalloc) ;; *) echo 'Invalid ALLOCATORS' >&2; exit 2;; esac
 allocator_list=$(printf '%s' "$ALLOCATORS" | tr ',' ' ')
 case "$ORDER_OFFSET" in 0|1|2|3|4|5) ;; *) echo 'ORDER_OFFSET must be 0..5' >&2; exit 2;; esac
 case "$ALLOW_FALLBACK" in 0|1) ;; *) echo 'ALLOW_FALLBACK must be 0 or 1' >&2; exit 2;; esac
-case "$MATRIX" in power|quick|full|threads) ;; *) echo "invalid MATRIX" >&2; exit 1;; esac
+case "$MATRIX" in power|quick|full|threads|processes) ;; *) echo "invalid MATRIX" >&2; exit 1;; esac
 for value in "$ITERATIONS" "$WARMUP" "$REPETITIONS" "$PRIMARY_ITERATIONS" "$PRIMARY_WARMUP"; do
   case "$value" in ''|*[!0-9]*|0) echo "counts must be positive integers" >&2; exit 1;; esac
 done
-case "$MIN_EXP:$MAX_EXP" in *[!0-9:]*|:|:*|*:) exit 2;; esac
-[ "$MIN_EXP" -ge 4 ] && [ "$MAX_EXP" -le 18 ] && [ "$MIN_EXP" -le "$MAX_EXP" ] || exit 2
+case "$MIN_EXP:$MAX_EXP" in
+  *[!0-9:]*|:|:*|*:) echo 'MIN_EXP and MAX_EXP must be integers (KiB exponents)' >&2; exit 2;;
+esac
+[ "$MIN_EXP" -ge 4 ] && [ "$MAX_EXP" -le 19 ] && [ "$MIN_EXP" -le "$MAX_EXP" ] || {
+  echo 'Size range must satisfy 4 <= MIN_EXP <= MAX_EXP <= 19 (16 KiB .. 512 MiB)' >&2; exit 2;
+}
 if [ "$MATRIX" = power ]; then
   case "$CPUS" in ''|*[!0-9]*) echo "power matrix requires one CPU ID (same-core processes)" >&2; exit 2;; esac
 fi
@@ -144,6 +154,10 @@ else
   if [ "$MATRIX" = threads ]; then
     modes=thread; touches=1; worker_counts=$thread_counts
     echo "THREAD_MATRIX counts=$THREAD_COUNTS touch_pages=1 cpus=$CPUS"
+  fi
+  if [ "$MATRIX" = processes ]; then
+    modes=process; touches=1; worker_counts=$process_counts
+    echo "PROCESS_MATRIX counts=$PROCESS_COUNTS touch_pages=1 cpus=$CPUS"
   fi
   if [ "$SIZE_SWEEP" = power ]; then
     sizes=; exponent=$MIN_EXP

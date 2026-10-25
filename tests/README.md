@@ -332,3 +332,36 @@ hold 为原 benchmark 的 touch/use 与辅助检查区间；all 为 malloc+hold+
 构建示例：`PERF_MINIMAL=1 bash tests/build_android_latency_bench.sh`。
 运行示例：`PERF_MINIMAL=1 ALLOCATORS=jemalloc MATRIX=threads SIZE_SWEEP=power THREAD_COUNTS=1,2,4,8 MIN_EXP=4 MAX_EXP=18 ALLOW_FALLBACK=1 CPUS=0 WARMUP=10 ITERATIONS=30 REPETITIONS=5 PRIMARY_WARMUP=1000 PRIMARY_ITERATIONS=10000 bash tests/run_phone_v3_tests.sh`。
 MAX_EXP=18 包含 256 MiB 观察点；17 保留之前 128 MiB 上限。两者都不重写分配路径。
+
+
+### 单独扫描多进程模式
+
+`MATRIX=processes` 只运行 `--mode process`（fork worker），不混入线程模式。
+`PROCESS_COUNTS=1,2,4,8` 指定每个 CPU 的进程 worker 数（默认 1、2、4、8）；
+worker 总数为 CPU 数乘以每 CPU worker 数，不含 benchmark 控制进程和 broker。
+该矩阵固定 `touch_pages=1`，每组比较 traditional/delegated。
+`SIZE_SWEEP=power` 仍按 `2^MIN_EXP .. 2^MAX_EXP KiB` 生成大小。
+`THREAD_COUNTS` 仅控制 `MATRIX=threads`，不控制进程矩阵。
+
+```bash
+PERF_MINIMAL=1 ALLOCATORS=scudo MATRIX=processes SIZE_SWEEP=power \
+PROCESS_COUNTS=1,2,4,8 MIN_EXP=4 MAX_EXP=18 \
+ALLOW_FALLBACK=1 CPUS=0 \
+WARMUP=5 ITERATIONS=10 REPETITIONS=2 \
+PRIMARY_WARMUP=1000 PRIMARY_ITERATIONS=10000 \
+bash tests/run_phone_v3_tests.sh
+```
+
+仅查看计划、无需连接手机：把最后一行替换为
+`bash tests/run_v2_android.sh --dry-run`。上述配置共 240 组。
+现有 `MATRIX=power` 是独立的 Scudo cache/mmap/delegated 三路进程矩阵，保持原行为。
+
+
+### 512 MiB 大小点
+
+主机和手机 runner 支持 `MAX_EXP=19`（512 MiB），默认仍为 18。
+请求大小不受 256 MiB Arena 容量限制；使用 `ALLOW_FALLBACK=1` 时，
+池无法容纳的请求通过分配器原生路径回退。它仍是 delegated 配置的实测结果，
+不改写为 traditional 数据。`touch_pages=1` 时，8 个 512 MiB worker 的
+请求 payload 合计约 4 GiB，实际峰值还包括分配器缓存及其他开销。
+双分配器、16 档大小、4 档进程数、2 条路径、5 次重复共 1280 组。

@@ -1,0 +1,11 @@
+{
+  "upstream_repository": "https://github.com/llvm/llvm-project.git",
+  "base_commit": "87f0227cb60147a26a1eeb4fb06e3b505e9c7261",
+  "captured_commit": "ddaece0ad5c1912baff327980c0da6e9596e7a4c",
+  "source_subdirectory": "compiler-rt/lib/scudo/standalone",
+  "patched_tree": "3f80f858bbc419558777676658a8fd40067b6e50",
+  "files": {
+    "scudo-llvm-87f0227cb601.tar.xz": "8592f97133d0c1ac0764c917ce298c999d787319432cd11b98880408f803756d",
+    "patches/scudo-llvm-87f0227cb601-delegation.patch": "3cbe2857805c220cf80fd760d1e28f522672edfcbe39f4c9c66707a1c9f5ec56"
+  }
+}
