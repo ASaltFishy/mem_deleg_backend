@@ -14,6 +14,7 @@
 #include <functional>
 #include <iterator>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -22,6 +23,8 @@
 #include <limits.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -47,6 +50,13 @@ extern "C" const char *md_cpu_query_mode() __attribute__((weak));
 #ifndef SCUDO_SECONDARY_STATS
 #define SCUDO_SECONDARY_STATS 1
 #endif
+#ifndef MD_SLOW_TRACE
+#define MD_SLOW_TRACE 0
+#endif
+
+#ifndef MD_TOUCH_TRACE
+#define MD_TOUCH_TRACE 0
+#endif
 
 #ifndef MD_BENCH_BUILD_ID
 #define MD_BENCH_BUILD_ID "unversioned"
@@ -71,11 +81,59 @@ struct Options {
   std::vector<int> Cpus;
 };
 
+#if MD_TOUCH_TRACE
+struct TouchSample {
+  uint64_t Pid, Index, Address, Start, End, CpuNs;
+  uint64_t Minor, Major, Voluntary, Involuntary, UserNs, SystemNs;
+  uint64_t Resident, Pages;
+};
+
+uint64_t threadCpuNs() {
+  timespec T{};
+  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &T)) return 0;
+  return uint64_t(T.tv_sec) * 1000000000 + T.tv_nsec;
+}
+
+uint64_t usageNs(const timeval &T) {
+  return uint64_t(T.tv_sec) * 1000000000 + uint64_t(T.tv_usec) * 1000;
+}
+#endif
+
+// Benchmark bookkeeping must not allocate from the allocator under test.
+// In particular, 10,000 u64 samples exceed Android Primary size classes.
+// Parent aggregation and percentile copies use the same independent storage.
+// Otherwise their ALLOC/FREE records can outlive the workload checkpoint.
+template <class T> struct SampleAllocator {
+  using value_type = T;
+  SampleAllocator() noexcept = default;
+  template <class U> SampleAllocator(const SampleAllocator<U> &) noexcept {}
+  T *allocate(size_t Count) {
+    if (Count > SIZE_MAX / sizeof(T)) throw std::bad_alloc();
+    void *Memory = mmap(nullptr, Count * sizeof(T), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (Memory == MAP_FAILED) throw std::bad_alloc();
+    return static_cast<T *>(Memory);
+  }
+  void deallocate(T *Pointer, size_t Count) noexcept {
+    if (Pointer) munmap(Pointer, Count * sizeof(T));
+  }
+  template <class U> bool operator==(const SampleAllocator<U> &) const noexcept { return true; }
+  template <class U> bool operator!=(const SampleAllocator<U> &) const noexcept { return false; }
+};
+template <class T> using SampleStorage = std::vector<T, SampleAllocator<T>>;
+
 struct Samples {
-  std::vector<uint64_t> Alloc;
-  std::vector<uint64_t> Hold;
-  std::vector<uint64_t> Dealloc;
-  std::vector<uint64_t> Round;
+  SampleStorage<uint64_t> Alloc;
+  SampleStorage<uint64_t> Hold;
+  SampleStorage<uint64_t> Dealloc;
+  SampleStorage<uint64_t> Round;
+#if MD_SLOW_TRACE
+  SampleStorage<uint64_t> AllocStart;
+  SampleStorage<uint64_t> Pids;
+#endif
+#if MD_TOUCH_TRACE
+  SampleStorage<TouchSample> Touch;
+#endif
   uint64_t Routes[8] = {}; // primary, delegated, secondary, cache calls, hits, fallback
   uint64_t Noise[4] = {}; // minor/major faults, voluntary/involuntary switches.
 };
@@ -85,6 +143,7 @@ struct Stats {
   uint64_t P50 = 0;
   uint64_t P95 = 0;
   uint64_t P99 = 0;
+  uint64_t Max = 0;
 };
 
 class Barrier {
@@ -92,8 +151,9 @@ public:
   explicit Barrier(unsigned Count) : Remaining(Count) {}
   void wait(std::atomic<int> &Error, bool Delegated) {
     std::unique_lock<std::mutex> Lock(Mutex);
+    NeedsCheckpoint |= Delegated;
     if (--Remaining == 0) {
-      int Result = allocatorCheckpoint(Delegated);
+      int Result = allocatorCheckpoint(NeedsCheckpoint);
       if (Result) Error.store(Result);
       Ready = true;
       Cv.notify_all();
@@ -106,6 +166,7 @@ private:
   std::condition_variable Cv;
   unsigned Remaining;
   bool Ready = false;
+  bool NeedsCheckpoint = false;
 };
 
 #if defined(MD_BENCH_JEMALLOC)
@@ -127,6 +188,13 @@ void prepareSamples(Samples &Out, uint64_t Count) {
   Out.Hold.resize(Count);
   Out.Dealloc.resize(Count);
   Out.Round.resize(Count);
+#if MD_TOUCH_TRACE
+  Out.Touch.resize(Count);
+#endif
+#if MD_SLOW_TRACE
+  Out.AllocStart.resize(Count);
+  Out.Pids.resize(Count);
+#endif
 }
 
 uint64_t nowNs() {
@@ -177,7 +245,13 @@ void touchPages(void *Pointer, size_t Size) {
     Bytes[Size - 1] ^= 1;
 }
 
-int runWarmup(const Options &Opt) {
+// Only bypass the unrelated backend checkpoint when every warmup allocation
+// was actually Primary. Mixed/Secondary routes retain the ownership boundary.
+int runWarmup(const Options &Opt, bool *PrimaryOnly = nullptr) {
+  if (PrimaryOnly) *PrimaryOnly = false;
+#if defined(MD_BENCH_SCUDO)
+  bool AllPrimary = Opt.Warmup != 0;
+#endif
   for (uint32_t I = 0; I < Opt.Warmup; ++I) {
     void *Pointer = allocateObject(Opt.Size);
     if (!Pointer)
@@ -186,27 +260,37 @@ int runWarmup(const Options &Opt) {
       releaseObject(Pointer);
       return ENOTSUP;
     }
+#if defined(MD_BENCH_SCUDO)
+    AllPrimary &= __scudo_bench_is_primary(Pointer) != 0;
+#endif
     if (Opt.TouchPages)
       touchPages(Pointer, Opt.Size);
     releaseObject(Pointer);
   }
+#if defined(MD_BENCH_SCUDO)
+  if (PrimaryOnly) *PrimaryOnly = AllPrimary;
+#endif
   return 0;
 }
 
 void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
                Samples &Out, std::atomic<int> &Error, bool Prepared = false) {
   int LocalError = 0;
+  bool WarmupPrimaryOnly = false;
   if (!Prepared) {
     if (!pinToCpu(Cpu)) LocalError = errno ? errno : EINVAL;
     prepareSamples(Out, Opt.Iterations);
-    if (!LocalError) LocalError = runWarmup(Opt);
+    if (!LocalError) LocalError = runWarmup(Opt, &WarmupPrimaryOnly);
   }
   if (LocalError) Error.store(LocalError);
-  if (Start) Start->wait(Error, Opt.Delegated);
+  if (Start) Start->wait(Error, Opt.Delegated && !WarmupPrimaryOnly);
   if (md_cpu_query_mode && !std::strncmp(md_cpu_query_mode(), "rseq_", 5))
     Out.Routes[6] = 1;
   else Out.Routes[7] = 1;
   rusage Before{}, After{};
+#if MD_SLOW_TRACE || MD_TOUCH_TRACE
+  const uint64_t WorkerPid = static_cast<uint64_t>(syscall(SYS_gettid));
+#endif
   if (getrusage(RUSAGE_THREAD, &Before)) Error.store(errno);
   uint64_t CacheCallsBefore = 0, CacheHitsBefore = 0;
   const bool CountCache = Prepared || Opt.Cpus.size() * Opt.WorkersPerCore == 1;
@@ -219,6 +303,18 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
   uint64_t Empty[500] = {};
   for (unsigned j=0;j<500;++j) { uint64_t a=mdprof::ticks(); Empty[j]=mdprof::ticks()-a; }
   std::sort(Empty,Empty+500);
+#endif
+#if MD_TOUCH_TRACE
+  const bool CheckResidency = std::getenv("MD_TOUCH_MINCORE") != nullptr;
+  const size_t TracePage = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t ResidencyBytes = Opt.Size / TracePage + 2;
+  auto *Residency = static_cast<unsigned char *>(MAP_FAILED);
+  if (CheckResidency) {
+    Residency = static_cast<unsigned char *>(mmap(nullptr, ResidencyBytes,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (Residency == MAP_FAILED) Error.store(errno);
+    else std::memset(Residency, 0, ResidencyBytes);
+  }
 #endif
   uint64_t Completed = 0;
   if (!Error.load()) {
@@ -242,8 +338,43 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
       if (__scudo_bench_is_primary(Pointer)) ++Out.Routes[0];
       else if (isDelegatedObject(Pointer)) ++Out.Routes[1];
       else { ++Out.Routes[2]; if (Opt.Delegated) ++Out.Routes[5]; }
+#elif defined(MD_BENCH_JEMALLOC)
+      // Sample after T1, outside alloc_only. Keep ordinary and delegated routes
+      // distinct even when small allocations or capacity exhaustion fall back.
+      if (isDelegatedObject(Pointer)) ++Out.Routes[1];
+      else { ++Out.Routes[2]; if (Opt.Delegated) ++Out.Routes[5]; }
+#endif
+#if MD_TOUCH_TRACE
+      rusage TouchBefore{}, TouchAfter{};
+      const uintptr_t RangeStart = reinterpret_cast<uintptr_t>(Pointer) & ~(TracePage - 1);
+      const uint64_t RangePages =
+          (reinterpret_cast<uintptr_t>(Pointer) - RangeStart + Opt.Size + TracePage - 1) / TracePage;
+      uint64_t Resident = UINT64_MAX;
+      if (CheckResidency) {
+        if (mincore(reinterpret_cast<void *>(RangeStart), RangePages * TracePage,
+                    Residency)) { Error.store(errno); break; }
+        Resident = 0;
+        for (size_t P = 0; P < RangePages; ++P) Resident += (Residency[P] & 1) != 0;
+      }
+      if (getrusage(RUSAGE_THREAD, &TouchBefore)) { Error.store(errno); break; }
+      const uint64_t CpuStart = threadCpuNs();
+      const uint64_t TouchStart = nowNs();
 #endif
       if (Opt.TouchPages) touchPages(Pointer, Opt.Size);
+#if MD_TOUCH_TRACE
+      const uint64_t TouchEnd = nowNs();
+      const uint64_t CpuEnd = threadCpuNs();
+      if (getrusage(RUSAGE_THREAD, &TouchAfter)) { Error.store(errno); break; }
+      Out.Touch[I] = {WorkerPid, I, reinterpret_cast<uintptr_t>(Pointer),
+          TouchStart, TouchEnd, CpuEnd - CpuStart,
+          uint64_t(TouchAfter.ru_minflt - TouchBefore.ru_minflt),
+          uint64_t(TouchAfter.ru_majflt - TouchBefore.ru_majflt),
+          uint64_t(TouchAfter.ru_nvcsw - TouchBefore.ru_nvcsw),
+          uint64_t(TouchAfter.ru_nivcsw - TouchBefore.ru_nivcsw),
+          usageNs(TouchAfter.ru_utime) - usageNs(TouchBefore.ru_utime),
+          usageNs(TouchAfter.ru_stime) - usageNs(TouchBefore.ru_stime),
+          Resident, RangePages};
+#endif
       const uint64_t T2 = nowNs();
       releaseObject(Pointer);
       const uint64_t T3 = nowNs();
@@ -251,6 +382,10 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
       Out.Hold[I] = T2 - T1;
       Out.Dealloc[I] = T3 - T2;
       Out.Round[I] = T3 - T0;
+#if MD_SLOW_TRACE
+      Out.AllocStart[I] = T0;
+      Out.Pids[I] = WorkerPid;
+#endif
       ++Completed;
     }
   }
@@ -276,10 +411,20 @@ void runWorker(const Options &Opt, int Cpu, Barrier *Start, Barrier *Finish,
 #endif
   // All measured workers finish before any thread performs the final drain.
   if (Finish) Finish->wait(Error, Opt.Delegated);
+#if MD_TOUCH_TRACE
+  if (Residency != MAP_FAILED) munmap(Residency, ResidencyBytes);
+#endif
   Out.Alloc.resize(Completed);
   Out.Hold.resize(Completed);
   Out.Dealloc.resize(Completed);
   Out.Round.resize(Completed);
+#if MD_TOUCH_TRACE
+  Out.Touch.resize(Completed);
+#endif
+#if MD_SLOW_TRACE
+  Out.AllocStart.resize(Completed);
+  Out.Pids.resize(Completed);
+#endif
 }
 
 bool writeExact(int Fd, const void *Data, size_t Size) {
@@ -315,14 +460,24 @@ bool sendSamples(int Fd, const Samples &Value, int Error) {
   if (!writeExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!writeExact(Fd, &Error, sizeof(Error)))
     return false;
-  const std::vector<uint64_t> *Vectors[] = {
-      &Value.Alloc, &Value.Hold, &Value.Dealloc, &Value.Round};
+  const SampleStorage<uint64_t> *Vectors[] = {
+      &Value.Alloc, &Value.Hold, &Value.Dealloc, &Value.Round,
+#if MD_SLOW_TRACE
+      &Value.AllocStart, &Value.Pids,
+#endif
+  };
   for (const auto *Vector : Vectors) {
     uint64_t Count = Vector->size();
     if (!writeExact(Fd, &Count, sizeof(Count)) ||
         (Count && !writeExact(Fd, Vector->data(), Count * sizeof(uint64_t))))
       return false;
   }
+#if MD_TOUCH_TRACE
+  const uint64_t TouchCount = Value.Touch.size();
+  if (!writeExact(Fd, &TouchCount, sizeof(TouchCount)) ||
+      (TouchCount && !writeExact(Fd, Value.Touch.data(), TouchCount * sizeof(TouchSample))))
+    return false;
+#endif
   return true;
 }
 
@@ -331,8 +486,12 @@ bool receiveSamples(int Fd, Samples &Value, int &Error) {
   if (!readExact(Fd, Value.Noise, sizeof(Value.Noise))) return false;
   if (!readExact(Fd, &Error, sizeof(Error)))
     return false;
-  std::vector<uint64_t> *Vectors[] = {
-      &Value.Alloc, &Value.Hold, &Value.Dealloc, &Value.Round};
+  SampleStorage<uint64_t> *Vectors[] = {
+      &Value.Alloc, &Value.Hold, &Value.Dealloc, &Value.Round,
+#if MD_SLOW_TRACE
+      &Value.AllocStart, &Value.Pids,
+#endif
+  };
   for (auto *Vector : Vectors) {
     uint64_t Count = 0;
     if (!readExact(Fd, &Count, sizeof(Count)))
@@ -341,13 +500,20 @@ bool receiveSamples(int Fd, Samples &Value, int &Error) {
     if (Count && !readExact(Fd, Vector->data(), Count * sizeof(uint64_t)))
       return false;
   }
+#if MD_TOUCH_TRACE
+  uint64_t TouchCount = 0;
+  if (!readExact(Fd, &TouchCount, sizeof(TouchCount))) return false;
+  Value.Touch.resize(TouchCount);
+  if (TouchCount && !readExact(Fd, Value.Touch.data(), TouchCount * sizeof(TouchSample)))
+    return false;
+#endif
   return true;
 }
 
 void appendSamples(Samples &To, Samples &&From) {
   for (unsigned I = 0; I < 8; ++I) To.Routes[I] += From.Routes[I];
   for (unsigned I = 0; I < 4; ++I) To.Noise[I] += From.Noise[I];
-  auto Append = [](std::vector<uint64_t> &Dst, std::vector<uint64_t> &Src) {
+  auto Append = [](SampleStorage<uint64_t> &Dst, SampleStorage<uint64_t> &Src) {
     Dst.insert(Dst.end(), std::make_move_iterator(Src.begin()),
                std::make_move_iterator(Src.end()));
   };
@@ -355,6 +521,14 @@ void appendSamples(Samples &To, Samples &&From) {
   Append(To.Hold, From.Hold);
   Append(To.Dealloc, From.Dealloc);
   Append(To.Round, From.Round);
+#if MD_TOUCH_TRACE
+  To.Touch.insert(To.Touch.end(), std::make_move_iterator(From.Touch.begin()),
+                  std::make_move_iterator(From.Touch.end()));
+#endif
+#if MD_SLOW_TRACE
+  Append(To.AllocStart, From.AllocStart);
+  Append(To.Pids, From.Pids);
+#endif
 }
 
 int runThreads(const Options &Opt, Samples &Combined) {
@@ -442,6 +616,23 @@ int runProcesses(const Options &Opt, const char *SelfExe, Samples &Combined) {
     if (!readExact(ChildValue.ReadFd, &ChildError, sizeof(ChildError))) return EIO;
     if (ChildError && !FirstError) FirstError = ChildError;
   }
+#if MD_TOUCH_TRACE
+  // Optional capture handshake after all mm checkpoints, outside measured work.
+  const char *PidFile = std::getenv("MD_TOUCH_PID_FILE");
+  const char *Gate = std::getenv("MD_TOUCH_GATE");
+  if (PidFile && Gate) {
+    FILE *File = std::fopen(PidFile, "w");
+    if (!File) return errno;
+    for (const auto &ChildValue : Children)
+      std::fprintf(File, "%d\n", ChildValue.Pid);
+    if (std::fclose(File)) return errno;
+    unsigned Wait = 0;
+    while (access(Gate, F_OK)) {
+      if (++Wait > 30000) return ETIMEDOUT;
+      usleep(1000);
+    }
+  }
+#endif
   const unsigned char StartByte = 'S';
   for (auto &ChildValue : Children) {
     if (!writeExact(ChildValue.StartFd, &StartByte, sizeof(StartByte)))
@@ -476,7 +667,7 @@ int runProcesses(const Options &Opt, const char *SelfExe, Samples &Combined) {
   return FirstError;
 }
 
-Stats summarize(std::vector<uint64_t> Values) {
+Stats summarize(SampleStorage<uint64_t> Values) {
   Stats Result;
   if (Values.empty())
     return Result;
@@ -492,14 +683,15 @@ Stats summarize(std::vector<uint64_t> Values) {
   Result.P50 = Percentile(0.50);
   Result.P95 = Percentile(0.95);
   Result.P99 = Percentile(0.99);
+  Result.Max = Values.back();
   return Result;
 }
 
-void printMetric(const char *Name, const std::vector<uint64_t> &Values) {
+void printMetric(const char *Name, const SampleStorage<uint64_t> &Values) {
   const Stats Result = summarize(Values);
   std::printf("\t%-12s\tmean=%.2f p50=%" PRIu64 " p95=%" PRIu64
-              " p99=%" PRIu64 "\n", Name, Result.Mean, Result.P50,
-              Result.P95, Result.P99);
+              " p99=%" PRIu64 " max=%" PRIu64 "\n", Name, Result.Mean, Result.P50,
+              Result.P95, Result.P99, Result.Max);
 }
 
 std::vector<int> parseCpus(const char *Text) {
@@ -551,7 +743,7 @@ void usage(const char *Argv0) {
 
 int main(int Argc, char **Argv) {
   if (Argc == 2 && !std::strcmp(Argv[1], "--build-info")) {
-    std::printf("bench_protocol=shared_rings_v3 route_protocol=scudo_routes_v1 build_id=%s scudo_secondary_stats=%d\n", MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS);
+    std::printf("bench_protocol=shared_rings_v3 route_protocol=scudo_routes_v1 build_id=%s scudo_secondary_stats=%d slow_trace=%d touch_trace=%d prepare_policy=primary_checkpoint_skip_v1\n", MD_BENCH_BUILD_ID, SCUDO_SECONDARY_STATS, MD_SLOW_TRACE, MD_TOUCH_TRACE);
     return 0;
   }
   Options Opt;
@@ -636,13 +828,18 @@ int main(int Argc, char **Argv) {
     Samples Local;
     if (!pinToCpu(RoleCpu)) Error.store(errno ? errno : EINVAL);
     prepareSamples(Local, Opt.Iterations);
-    if (!Error.load()) Error.store(runWarmup(Opt));
+    bool WarmupPrimaryOnly = false;
+    if (!Error.load()) Error.store(runWarmup(Opt, &WarmupPrimaryOnly));
     const unsigned char ReadyByte = 1;
     if (!writeExact(RoleOutFd, &ReadyByte, 1)) return 1;
     unsigned char Command = 0;
     if (!readExact(RoleStartFd, &Command, 1) || Command != 'D') return 1;
-    int CheckError = allocatorCheckpoint(Opt.Delegated);
-    if (CheckError) Error.store(CheckError);
+    int CheckError = allocatorCheckpoint(Opt.Delegated && !WarmupPrimaryOnly);
+    if (CheckError) {
+      std::fprintf(stderr, "checkpoint failed: phase=pre_measurement pid=%d error=%d (%s)\n",
+                   getpid(), CheckError, std::strerror(CheckError));
+      Error.store(CheckError);
+    }
     CheckError = Error.load();
     if (!writeExact(RoleOutFd, &CheckError, sizeof(CheckError))) return 1;
     if (!readExact(RoleStartFd, &Command, 1) || Command != 'S') return 1;
@@ -652,7 +849,11 @@ int main(int Argc, char **Argv) {
     if (!readExact(RoleStartFd, &Command, 1) || Command != 'F') return 1;
     close(RoleStartFd);
     CheckError = allocatorCheckpoint(Opt.Delegated);
-    if (CheckError) Error.store(CheckError);
+    if (CheckError) {
+      std::fprintf(stderr, "checkpoint failed: phase=post_measurement pid=%d error=%d (%s)\n",
+                   getpid(), CheckError, std::strerror(CheckError));
+      Error.store(CheckError);
+    }
     const bool Ok = sendSamples(RoleOutFd, Local, Error.load());
     close(RoleOutFd);
     return Ok && !Error.load() ? 0 : 1;
@@ -698,10 +899,39 @@ int main(int Argc, char **Argv) {
               Combined.Routes[3], Combined.Routes[4], Combined.Routes[5],
               Combined.Alloc.size(), Opt.CacheEnabled ? "enabled" : "disabled",
               Opt.AllowFallback ? 1 : 0, Combined.Routes[6], Combined.Routes[7]);
+#elif defined(MD_BENCH_JEMALLOC)
+  std::printf("bench_jemalloc_routes: delegated=%" PRIu64 " ordinary=%" PRIu64
+              " fallback=%" PRIu64 " samples=%zu allow_fallback=%d\n",
+              Combined.Routes[1], Combined.Routes[2], Combined.Routes[5],
+              Combined.Alloc.size(), Opt.AllowFallback ? 1 : 0);
 #endif
   printMetric("alloc_only", Combined.Alloc);
+  std::printf("bench_trace: samples_enabled=%d diagnostic_only=%d\n", MD_SLOW_TRACE, MD_SLOW_TRACE || MD_TOUCH_TRACE);
+  std::printf("bench_prepare: policy=primary_checkpoint_skip_v1 clock=steady_wall\n");
   printMetric("hold_only", Combined.Hold);
   printMetric("dealloc_only", Combined.Dealloc);
   printMetric("all", Combined.Round);
+#if MD_SLOW_TRACE
+  // Dump only after every worker finished and checkpointed. Recording adds no
+  // syscall, allocation or printing inside the timed allocation interval.
+  for (size_t I = 0; I < Combined.Alloc.size(); ++I)
+    std::printf("ALLOC_SAMPLE pid=%" PRIu64 " start_ns=%" PRIu64
+                " end_ns=%" PRIu64 " wall_ns=%" PRIu64 "\n",
+                Combined.Pids[I], Combined.AllocStart[I],
+                Combined.AllocStart[I] + Combined.Alloc[I], Combined.Alloc[I]);
+#endif
+#if MD_TOUCH_TRACE
+  std::printf("bench_touch_trace: enabled=1 diagnostic_only=1\n");
+  for (const auto &T : Combined.Touch)
+    std::printf("TOUCH_SAMPLE pid=%" PRIu64 " index=%" PRIu64 " address=%" PRIu64
+                " start_ns=%" PRIu64 " end_ns=%" PRIu64 " wall_ns=%" PRIu64
+                " cpu_ns=%" PRIu64 " minor=%" PRIu64 " major=%" PRIu64
+                " voluntary_cs=%" PRIu64 " involuntary_cs=%" PRIu64
+                " user_ns=%" PRIu64 " system_ns=%" PRIu64
+                " resident_pages=%" PRIu64 " range_pages=%" PRIu64 "\n",
+                T.Pid, T.Index, T.Address, T.Start, T.End, T.End - T.Start,
+                T.CpuNs, T.Minor, T.Major, T.Voluntary, T.Involuntary,
+                T.UserNs, T.SystemNs, T.Resident, T.Pages);
+#endif
   return 0;
 }

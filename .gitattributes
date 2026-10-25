@@ -1,0 +1,4 @@
+
+# Preserve exported CSV bytes and unified patch context as release evidence.
+milestones/**/evidence/**/*.csv whitespace=cr-at-eol
+third_party/patches/*.patch -whitespace

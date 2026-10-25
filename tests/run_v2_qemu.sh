@@ -24,6 +24,10 @@ for value in "$iterations" "$warmup" "$repetitions"; do [[ "$value" =~ ^[1-9][0-
 # Avoid executing stale optional binaries from a previous invocation.
 rm -f "$work/root/bin/allocator_latency_jemalloc"
 rm -f "$work/root/enable_latency"
+rm -f "$work/root/bin/scudo_capacity_test"
+if [[ "${RUN_CAPACITY:-0}" == 1 ]]; then
+  cp "$root/build/scudo_capacity_test.linux.aarch64" "$work/root/bin/scudo_capacity_test"
+fi
 if [[ "$latency" == 1 ]]; then
   strings "$root/build/allocator_latency_scudo.linux.aarch64" | grep "bench_protocol=shared_rings_v3" >/dev/null || { echo "Rebuild stale scudo binary for ABI v3" >&2; exit 1; }
   cp "$root/build/allocator_latency_scudo.linux.aarch64" "$work/root/bin/allocator_latency_scudo"
@@ -56,6 +60,9 @@ EXPECT_RSEQ=1 /bin/cpu_reader_test || fail cpu_reader
 GLIBC_TUNABLES=glibc.pthread.rseq=0 EXPECT_RSEQ=1 /bin/cpu_reader_test || fail cpu_reader_owned
 MD_CPU_QUERY=syscall /bin/cpu_reader_test || fail cpu_reader_fallback
 GLIBC_TUNABLES=glibc.pthread.rseq=0 /bin/backend_v2_test || fail backend
+if test -x /bin/scudo_capacity_test; then
+  SCUDO_DELEGATION_BACKEND=1 GLIBC_TUNABLES=glibc.pthread.rseq=0 /bin/scudo_capacity_test || fail capacity
+fi
 if test -f /enable_latency; then
   export GLIBC_TUNABLES=glibc.pthread.rseq=0
   . /latency-config

@@ -8,7 +8,7 @@ import statistics
 
 VARIANTS = ('cache', 'mmap', 'delegated')
 LABELS = {'cache': 'Traditional (cache enabled)', 'mmap': 'Traditional (cache disabled)',
-          'delegated': 'Delegation enabled (fallback allowed)'}
+          'delegated': 'Delegation enabled'}
 
 
 def parse_log(text):
@@ -22,13 +22,20 @@ def parse_log(text):
                        for k, v in (item.split('=', 1) for item in line.split()[1:])}
         elif current is not None and line.startswith('bench_routes: '):
             current.update({k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', line)})
+        elif current is not None and line.startswith('bench_trace: ') and 'diagnostic_only=1' in line:
+            raise ValueError('Diagnostic trace run cannot be used for performance curves')
+        elif current is not None and line.startswith('bench_noise: '):
+            current.update({'noise_' + k: int(v) for k, v in
+                            re.findall(r'(minor_faults|major_faults|voluntary_cs|involuntary_cs)=(\d+)', line)})
         elif current is not None and line.startswith('bench_lifecycle: '):
             if 'pre_checkpoint=ok post_checkpoint=ok' not in line:
                 raise ValueError('checkpoint failed')
             current['checkpoint_ok'] = 1
-        elif current is not None and re.match(r'\s*alloc_only\s+mean=', line):
-            current.update({'alloc_' + k: float(v) for k, v in
-                            re.findall(r'(mean|p50|p95|p99)=([0-9.eE+-]+)', line)})
+        elif current is not None and re.match(r'\s*(alloc_only|dealloc_only|hold_only|all)\s+mean=', line):
+            stage = re.match(r'\s*(\w+)', line)[1]
+            prefix = {'alloc_only': 'alloc', 'dealloc_only': 'free', 'hold_only': 'hold', 'all': 'all'}[stage]
+            current.update({prefix + '_' + k: float(v) for k, v in
+                            re.findall(r'(mean|p50|p95|p99|max)=([0-9.eE+-]+)', line)})
         elif line.startswith('POWER_CASE_FAIL'):
             raise ValueError(line)
         elif line.startswith('POWER_CASE_PASS '):
@@ -42,6 +49,11 @@ def parse_log(text):
                 raise ValueError('Route counts do not match samples')
             if current['cache_hits'] > current['secondary']:
                 raise ValueError('Cache hits exceed ordinary Secondary allocations')
+            # Legacy logs did not report the largest sample. Preserve that as
+            # missing, rather than inventing a max from p99 or zero.
+            for key in ('minor_faults', 'major_faults', 'voluntary_cs', 'involuntary_cs'):
+                current.setdefault('noise_' + key, None)
+            current.setdefault('alloc_max', None)
             rows.append(current)
             current = None
     if current is not None or not rows:
@@ -51,20 +63,30 @@ def parse_log(text):
     return rows
 
 
-def summarize(rows):
+def summarize(rows, prefix='alloc'):
     groups = {}
     for row in rows:
         groups.setdefault((row['processes'], row['exponent'], row['variant']), []).append(row)
     result = []
     for (processes, exponent, variant), runs in sorted(groups.items()):
-        means = [r['alloc_mean'] for r in runs]
+        means = [r[prefix + '_mean'] for r in runs]
         n = sum(r['samples'] for r in runs)
         secondary = sum(r['secondary'] for r in runs)
         hits = sum(r['cache_hits'] for r in runs)
         result.append(dict(processes=processes, exponent=exponent, kib=2**exponent,
                            variant=variant, mean_ns=statistics.mean(means),
+                           # These are summaries of run-level quantiles, not
+                           # quantiles reconstructed from pooled raw samples.
+                           p50_run_median_ns=statistics.median(r[prefix + '_p50'] for r in runs),
+                           p95_run_median_ns=statistics.median(r[prefix + '_p95'] for r in runs),
+                           p99_run_median_ns=statistics.median(r[prefix + '_p99'] for r in runs),
+                           run_mean_median_ns=statistics.median(means),
+                           max_ns=max(r[prefix + '_max'] for r in runs)
+                           if all(r[prefix + '_max'] is not None for r in runs) else None,
                            std_ns=statistics.stdev(means) if len(means) > 1 else 0,
                            repetitions=len(runs), samples=n,
+                           involuntary_cs=sum(r['noise_involuntary_cs'] for r in runs)
+                           if all(r['noise_involuntary_cs'] is not None for r in runs) else None,
                            primary_pct=100*sum(r['primary'] for r in runs)/n,
                            delegated_pct=100*sum(r['delegated'] for r in runs)/n,
                            fallback_pct=100*sum(r['fallback'] for r in runs)/n,
@@ -81,19 +103,20 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def plot(summary, output):
+def plot(summary, output, metric='mean_ns', stage='alloc'):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     colors = {'cache': '#d62728', 'mmap': '#ff8c00', 'delegated': '#1675b9'}
     markers = {'cache': 's', 'mmap': '^', 'delegated': 'o'}
+    stage_label = {'alloc': 'Malloc', 'free': 'Free', 'hold': 'Hold', 'all': 'Round trip: malloc + hold + free'}[stage]
     fig, axes = plt.subplots(1, 3, figsize=(21, 6), squeeze=False)
     for ax, processes in zip(axes[0], (1, 2, 4)):
         for variant in VARIANTS:
             data = [r for r in summary if r['processes'] == processes and r['variant'] == variant]
             x = [r['exponent'] for r in data]
-            y = [r['mean_ns'] for r in data]
-            sd = [r['std_ns'] for r in data]
+            y = [r[metric] for r in data]
+            sd = [r['std_ns'] if metric == 'mean_ns' else 0 for r in data]
             ax.plot(x, y, marker=markers[variant], color=colors[variant], linewidth=2,
                     markersize=4, label=LABELS[variant])
             ax.fill_between(x, [max(m-s, m*0.01) for m, s in zip(y, sd)],
@@ -105,7 +128,7 @@ def plot(summary, output):
                 elif variant == 'delegated' and r['fallback_pct']:
                     note = f"F {r['fallback_pct']:.0f}%"
                 if note:
-                    ax.annotate(note, (r['exponent'], r['mean_ns']), xytext=(0, 8),
+                    ax.annotate(note, (r['exponent'], r[metric]), xytext=(0, 8),
                                 textcoords='offset points', ha='center', fontsize=6,
                                 color=colors[variant])
         by_exp = {}
@@ -115,7 +138,7 @@ def plot(summary, output):
         for e, variants in by_exp.items():
             if set(variants) == set(VARIANTS):
                 c, d = variants['cache'], variants['delegated']
-                ax.annotate(f"{c['mean_ns']/d['mean_ns']:.2f}x", (e, d['mean_ns']),
+                ax.annotate(f"{c[metric]/d[metric]:.2f}x", (e, d[metric]),
                             xytext=(0, -13), textcoords='offset points', ha='center', fontsize=6)
         exps = sorted(by_exp)
         primary = [e for e, variants in by_exp.items()
@@ -128,16 +151,26 @@ def plot(summary, output):
         ax.set_xticks(ticks, [rf'$2^{{{e}}}$' for e in ticks])
         ax.set_xticks(exps, minor=True)
         ax.set_xlabel('Allocation size (KiB)')
-        ax.set_ylabel('alloc_only mean latency (ns)')
+        ax.set_ylabel(f'{stage_label} mean wall time (ns)' if metric == 'mean_ns'
+                      else f'Median of per-run {stage_label.lower()} p50 (ns)')
         ax.grid(which='both', linestyle='--', alpha=.25)
         ax.legend(fontsize=7, loc='best')
-    fig.suptitle('Scudo allocation latency: Primary / Secondary cache / mmap / delegation', fontsize=16)
-    fig.text(.5, .01, 'Band: ±1 sample SD across repeated runs.  x: cache-enabled / delegation latency. '
-             'H: measured Secondary cache hit %.  F: measured fallback %.  Green: observed Primary only.',
+    fig.suptitle(f'Scudo: {stage_label}', fontsize=16)
+    band_note = 'Band: ±1 SD of run means.  ' if metric == 'mean_ns' else 'Median of run p50s; no pooled quantile.  '
+    fig.text(.5, .01, band_note + 'x: cache-enabled / delegation latency. '
+             'H: cache hit %. F: fallback %. Green: Primary. Round trip excludes warmup/checkpoints.',
              ha='center', fontsize=9)
-    fig.tight_layout(rect=(0, .045, 1, .94))
+    fig.canvas.draw()
+    fig.tight_layout(rect=(.015, .045, .99, .94))
     for suffix in ('png', 'pdf'):
-        fig.savefig(output / f'scudo_alloc_only.{suffix}', dpi=180)
+        name = {'alloc': 'malloc', 'free': 'free', 'hold': 'hold', 'all': 'all'}[stage]
+        stem = f'scudo_{name}' + ('' if metric == 'mean_ns' else '_p50')
+        fig.savefig(output / f'{stem}.{suffix}', dpi=180, bbox_inches='tight')
+        if stage == 'alloc':
+            legacy = 'scudo_alloc_only' if metric == 'mean_ns' else 'scudo_alloc_only_p50'
+            fig.savefig(output / f'{legacy}.{suffix}', dpi=180, bbox_inches='tight')
+    if metric == 'mean_ns':
+        plot(summary, output, metric='p50_run_median_ns', stage=stage)
     plt.close(fig)
 
 
@@ -148,11 +181,22 @@ def main():
     args = parser.parse_args()
     rows = parse_log(args.log.read_text())
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary = summarize(rows)
     write_csv(args.output_dir/'raw_results.csv', rows)
-    write_csv(args.output_dir/'summary.csv', summary)
-    plot(summary, args.output_dir)
-    print(f'Plots: {args.output_dir / "scudo_alloc_only.png"}')
+    all_metrics = []
+    for stage in ('alloc', 'free', 'hold', 'all'):
+        needed = [stage + '_' + stat for stat in ('mean', 'p50', 'p95', 'p99')]
+        if any(any(key not in row for key in needed) for row in rows):
+            raise ValueError(f'Missing {stage} metrics in log')
+        for row in rows:
+            row.setdefault(stage + '_max', None)
+        summary = summarize(rows, prefix=stage)
+        all_metrics.extend(dict(metric=stage, **row) for row in summary)
+        if stage == 'alloc':
+            write_csv(args.output_dir/'summary.csv', summary)
+        plot(summary, args.output_dir, stage=stage)
+        name = {'alloc': 'malloc', 'free': 'free', 'hold': 'hold', 'all': 'all'}[stage]
+        print(f'Plot: {args.output_dir / ("scudo_" + name + ".png")}')
+    write_csv(args.output_dir/'summary_all_metrics.csv', all_metrics)
     print(f'Data: {args.output_dir / "raw_results.csv"}')
 
 

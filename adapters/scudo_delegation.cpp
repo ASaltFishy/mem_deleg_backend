@@ -6,12 +6,16 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sched.h>
+#include <errno.h>
 
 namespace scudo {
 namespace {
 
 atomic_u32 InitState = {};
 md_backend *Backend = nullptr;
+// Published with InitState; preserve open failure for later diagnostics.
+int BackendInitError = ENODEV;
+thread_local ScudoDelegationFailure LastFailure{};
 
 bool envEnabled(const char *Name, bool DefaultValue) {
   const char *Value = getenv(Name);
@@ -44,7 +48,8 @@ void initialize() {
 #endif
   Config.capacity = MD_DEFAULT_ARENA_CAPACITY;
   Config.reset = envEnabled("MEMORY_DELEGATION_RESET", false) ? 1 : 0;
-  if (md_backend_open(&Backend, &Config) != 0)
+  BackendInitError = md_backend_open(&Backend, &Config);
+  if (BackendInitError != 0)
     Backend = nullptr;
   atomic_store(&InitState, Backend != nullptr ? 2u : 3u,
                memory_order_release);
@@ -72,24 +77,33 @@ bool scudoDelegationContains(uptr Address) {
   return Current != nullptr && md_contains(Current, Address);
 }
 
+ScudoDelegationFailure scudoDelegationLastFailure() { return LastFailure; }
+
 bool scudoDelegationAcquire(uptr Size, uptr Alignment, uptr HeadersSize,
                             ScudoDelegationLease &Lease,
                             uptr &EntryHeaderPosition) {
   md_backend *Current = getBackend();
-  if (Current == nullptr)
+  if (Current == nullptr) {
+    LastFailure = {BackendInitError ? BackendInitError : ENODEV, Size};
     return false;
+  }
   md_lease Acquired{};
   uptr PageSize = getPageSizeCached();
-  if (md_acquire(Current, Size + HeadersSize + Alignment,
+  const uptr RequestedSize = Size + HeadersSize + Alignment;
+  int Error = md_acquire(Current, RequestedSize,
                  Max(Alignment, PageSize),
-                 md_process_id(), &Acquired) != 0)
+                 md_process_id(), &Acquired);
+  if (Error) {
+    LastFailure = {Error, RequestedSize};
     return false;
+  }
   EntryHeaderPosition = roundUp(Acquired.address + HeadersSize, Alignment) -
                         HeadersSize;
   if (EntryHeaderPosition < Acquired.address ||
       EntryHeaderPosition + HeadersSize + Size >
           Acquired.address + Acquired.size) {
     (void)md_release(Current, &Acquired, 0, nullptr);
+    LastFailure = {EFAULT, RequestedSize};
     return false;
   }
   Lease.BlockId = Acquired.block_id;
@@ -122,5 +136,11 @@ bool scudoDelegationRelease(const ScudoDelegationLease &Lease) {
 
 #include <errno.h>
 extern "C" int md_scudo_checkpoint() {
-  return scudo::getBackend() ? md_backend_checkpoint(scudo::getBackend()) : ENODEV;
+  // A checkpoint observes existing activity; it must not lazily open/register
+  // every Arena for a workload that has never used the delegation backend.
+  if (scudo::atomic_load(&scudo::InitState, scudo::memory_order_acquire) == 0u)
+    return 0;
+  md_backend *Current = scudo::getBackend();
+  return Current ? md_backend_checkpoint(Current)
+                 : (scudo::BackendInitError ? scudo::BackendInitError : ENODEV);
 }

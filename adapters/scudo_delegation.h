@@ -15,6 +15,14 @@ struct ScudoDelegationLease {
   uptr Size = 0;
 };
 
+// Last failed backend request on this thread. Written only on the failure path;
+// callers inspect it after a fallback, outside the allocation timing interval.
+struct ScudoDelegationFailure {
+  int Error;
+  uptr RequestedSize;
+};
+ScudoDelegationFailure scudoDelegationLastFailure();
+
 bool scudoDelegationEnabled();
 bool scudoDelegationContains(uptr Address);
 bool scudoDelegationAcquire(uptr Size, uptr Alignment, uptr HeadersSize,

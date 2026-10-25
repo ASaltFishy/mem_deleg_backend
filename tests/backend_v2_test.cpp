@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
+#include <fcntl.h>
 
 #define CHECK(X) do { if (!(X)) { fprintf(stderr,"FAIL(backend-v2): line=%d %s errno=%d\n",__LINE__,#X,errno); exit(1); } } while (0)
 static unsigned Home, Remote;
@@ -26,6 +27,65 @@ static void *childAcquire(void *P) {
   return nullptr;
 }
 static void checkpoint(md_backend *B) { CHECK(md_backend_checkpoint(B)==0); }
+static bool ptePresent(int Fd, uintptr_t Address) {
+  uint64_t Entry = 0;
+  off_t Offset = (Address / static_cast<size_t>(sysconf(_SC_PAGESIZE))) * sizeof(Entry);
+  CHECK(pread(Fd, &Entry, sizeof(Entry), Offset) == static_cast<ssize_t>(sizeof(Entry)));
+  return (Entry & (1ULL << 63)) != 0;
+}
+static void deltaReplayGapTest(md_backend *B, unsigned Rounds) {
+  pin(Home);
+  uint32_t Owner = md_process_id();
+  md_lease Left{}, Gap{}, Right{};
+  CHECK(!md_acquire(B, 4096, 4096, Owner, &Left));
+  CHECK(!md_acquire(B, 4096, 4096, Owner, &Gap));
+  CHECK(!md_acquire(B, 4096, 4096, Owner, &Right));
+  CHECK(Gap.address == Left.address + 4096 && Right.address == Gap.address + 4096);
+  *(volatile unsigned char *)Left.address = 0x11;
+  *(volatile unsigned char *)Gap.address = 0x55;
+  *(volatile unsigned char *)Right.address = 0x22;
+  CHECK(!md_release(B, &Left, 0, nullptr));
+  CHECK(!md_release(B, &Right, 0, nullptr));
+  int Ready[2], Finish[2]; CHECK(!pipe(Ready) && !pipe(Finish));
+  pid_t Child = fork(); CHECK(Child >= 0);
+  if (!Child) {
+    close(Ready[0]); close(Finish[1]);
+    md_lease A{}, C{};
+    for (unsigned I=0; I<=Rounds; ++I) {
+      CHECK(!md_acquire(B, 4096, 4096, md_process_id(), &A));
+      CHECK(!md_acquire(B, 4096, 4096, md_process_id(), &C));
+      CHECK(A.address == Left.address && C.address == Right.address);
+      *(volatile unsigned char *)A.address = 0x33;
+      *(volatile unsigned char *)C.address = 0x44;
+      if (I != Rounds) {
+        CHECK(!md_release(B, &A, 0, nullptr));
+        CHECK(!md_release(B, &C, 0, nullptr));
+        // Wrap the PTE delta history, not the separate publication ring.
+        // The parent stays blocked and cannot advance its own last_seen.
+        if ((I % 64) == 63) checkpoint(B);
+      }
+    }
+    unsigned char Byte=1; CHECK(write(Ready[1], &Byte, 1)==1);
+    CHECK(read(Finish[0], &Byte, 1)==1);
+    CHECK(!md_release(B, &A, 0, nullptr));
+    CHECK(!md_release(B, &C, 0, nullptr));
+    checkpoint(B); _exit(0);
+  }
+  close(Ready[1]); close(Finish[0]);
+  unsigned char Byte; CHECK(read(Ready[0], &Byte, 1)==1);
+  checkpoint(B);
+  int Map = open("/proc/self/pagemap", O_RDONLY); CHECK(Map >= 0);
+  // The revoked pages must disappear, while a live owned gap must retain its
+  // existing PTE (not merely fault back in after an over-wide union unmap).
+  CHECK(!ptePresent(Map, Left.address) && !ptePresent(Map, Right.address));
+  CHECK(ptePresent(Map, Gap.address)); close(Map);
+  CHECK(*(volatile unsigned char *)Gap.address == 0x55);
+  CHECK(write(Finish[1], &Byte, 1)==1);
+  close(Ready[0]); close(Finish[1]);
+  int Status; CHECK(waitpid(Child, &Status, 0)==Child && WIFEXITED(Status) && !WEXITSTATUS(Status));
+  CHECK(!md_release(B, &Gap, 0, nullptr)); checkpoint(B);
+  printf("PASS(backend-v2): delta replay rounds=%u revokes both sides; owned gap PTE retained\n", Rounds);
+}
 int main() {
   setbuf(stdout,nullptr);
   cpu_set_t Allowed; CHECK(!sched_getaffinity(0,sizeof(Allowed),&Allowed));
@@ -124,6 +184,7 @@ int main() {
   }
   CHECK(waitpid(Child,&Status,0)==Child && WIFEXITED(Status) && !WEXITSTATUS(Status));
   puts("PASS(backend-v2): concurrent first use after fork registers sessions once");
+  if (Kernel) { deltaReplayGapTest(B, 128); deltaReplayGapTest(B, 2300); }
   md_get_stats(B,&Stats); CHECK(Stats.bytes_in_use==0);
   printf("BACKEND_V2_END acquired=%llu released=%llu rejected=%llu live=%llu\n",
       (unsigned long long)Stats.acquire_successes,(unsigned long long)Stats.release_successes,

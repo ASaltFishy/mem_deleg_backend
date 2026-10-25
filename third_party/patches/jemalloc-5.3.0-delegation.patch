@@ -1,0 +1,50 @@
+--- a/src/pac.c
++++ b/src/pac.c
+@@ -3,6 +3,10 @@
+ 
+ #include "jemalloc/internal/pac.h"
+ #include "jemalloc/internal/san.h"
++
++extern int md_jemalloc_owns(void *) __attribute__((weak));
++extern int md_jemalloc_hooks(void *) __attribute__((weak));
++extern void md_jemalloc_request(int) __attribute__((weak));
+ 
+ static edata_t *pac_alloc_impl(tsdn_t *tsdn, pai_t *self, size_t size,
+     size_t alignment, bool zero, bool guarded, bool frequent_reuse,
+@@ -112,6 +116,21 @@
+ pac_alloc_real(tsdn_t *tsdn, pac_t *pac, ehooks_t *ehooks, size_t size,
+     size_t alignment, bool zero, bool guarded) {
+ 	assert(!guarded || alignment <= PAGE);
++	if (md_jemalloc_hooks && md_jemalloc_request && size >= 128 * 1024 && !guarded &&
++	    md_jemalloc_hooks(ehooks_get_extent_hooks_ptr(ehooks))) {
++		bool commit = true;
++		md_jemalloc_request(1);
++		edata_t *delegated = extent_alloc_wrapper(tsdn, pac, ehooks, NULL, size,
++		    alignment, zero, &commit, false);
++		md_jemalloc_request(0);
++		if (delegated != NULL) {
++			if (config_stats) {
++				atomic_fetch_add_zu(&pac->stats->pac_mapped, size,
++				    ATOMIC_RELAXED);
++			}
++			return delegated;
++		}
++	}
+ 
+ 	edata_t *edata = ecache_alloc(tsdn, pac, ehooks, &pac->ecache_dirty,
+ 	    NULL, size, alignment, zero, guarded);
+@@ -252,6 +271,14 @@
+     bool *deferred_work_generated) {
+ 	pac_t *pac = (pac_t *)self;
+ 	ehooks_t *ehooks = pac_ehooks_get(pac);
++	if (md_jemalloc_owns && md_jemalloc_owns(edata_base_get(edata))) {
++		if (config_stats) {
++			atomic_fetch_sub_zu(&pac->stats->pac_mapped,
++			    edata_size_get(edata), ATOMIC_RELAXED);
++		}
++		extent_dalloc_wrapper(tsdn, pac, ehooks, edata);
++		return;
++	}
+ 
+ 	if (edata_guarded_get(edata)) {
+ 		/*

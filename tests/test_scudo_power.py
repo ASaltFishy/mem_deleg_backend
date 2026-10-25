@@ -11,14 +11,14 @@ class PowerSweepTests(unittest.TestCase):
     def test_default_plan(self):
         text = subprocess.check_output(['bash', str(ROOT/'tests/run_v2_android.sh'), '--dry-run'], text=True)
         lines = [line for line in text.splitlines() if line.startswith('POWER_CASE_BEGIN')]
-        self.assertEqual(len(lines), 270)
+        self.assertEqual(len(lines), 675)
         cases = [dict(item.split('=', 1) for item in line.split()[1:]) for line in lines]
         self.assertEqual({int(c['exponent']) for c in cases}, set(range(4, 19)))
         self.assertEqual({c['processes'] for c in cases}, {'1', '2', '4'})
         self.assertEqual({c['variant'] for c in cases}, {'cache', 'mmap', 'delegated'})
-        self.assertEqual({c['repetition'] for c in cases}, {'1', '2'})
+        self.assertEqual({c['repetition'] for c in cases}, {'1', '2', '3', '4', '5'})
         self.assertTrue(all(int(c['bytes']) == 1024*(2**int(c['exponent'])) for c in cases))
-        self.assertEqual(len({(c['exponent'], c['processes'], c['variant'], c['repetition']) for c in cases}), 270)
+        self.assertEqual(len({(c['exponent'], c['processes'], c['variant'], c['repetition']) for c in cases}), 675)
 
     def example(self):
         return '''POWER_CASE_BEGIN index=1 total=1 exponent=7 kib=128 bytes=131072 processes=1 cpu=0 variant=delegated repetition=1

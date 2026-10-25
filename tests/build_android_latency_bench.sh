@@ -4,6 +4,10 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 ndk="${ANDROID_NDK_ROOT:-/home/lrc/patent/kernel/kernel_platform/prebuilts/ndk-r26}"
 api="${ANDROID_API:-34}"
 secondary_stats="${SCUDO_SECONDARY_STATS:-0}"
+slow_trace="${MD_SLOW_TRACE:-0}"
+touch_trace="${MD_TOUCH_TRACE:-0}"
+[[ "$touch_trace" == 0 || "$touch_trace" == 1 ]] || { echo 'MD_TOUCH_TRACE must be 0 or 1' >&2; exit 2; }
+[[ "$slow_trace" == 0 || "$slow_trace" == 1 ]] || { echo 'MD_SLOW_TRACE must be 0 or 1' >&2; exit 2; }
 [[ "$secondary_stats" == 0 || "$secondary_stats" == 1 ]] || {
   echo 'SCUDO_SECONDARY_STATS must be 0 or 1' >&2; exit 2;
 }
@@ -30,6 +34,8 @@ from pathlib import Path
 h=hashlib.sha256()
 import os
 h.update(os.environ.get('MD_PROFILE_STAGE','0').encode())
+h.update(os.environ.get('MD_SLOW_TRACE','0').encode())
+h.update(os.environ.get('MD_TOUCH_TRACE','0').encode())
 h.update(os.environ.get('SCUDO_SECONDARY_STATS','0').encode())
 for directory, names in [(sys.argv[1], ['tests/build_android_latency_bench.sh','include/latency_profile.h','src/delegation_backend.cpp','delegation_backend.h','src/kernel_bridge.cpp','kernel_bridge.h','src/jemalloc_adapter.cpp','tests/allocator_latency_bench.cpp']), (sys.argv[2], ['scudo_delegation.cpp','secondary.h']), (sys.argv[3], ['lib/libjemalloc.a'])]:
  for name in names:
@@ -39,7 +45,7 @@ PY
 )"
 # Android Scudo requires native TLS: emulated TLS calls malloc recursively.
 [[ "$api" -ge 29 ]] || { echo "Native TLS requires Android API >= 29" >&2; exit 1; }
-common=(-DSCUDO_SECONDARY_STATS="$secondary_stats" -fno-builtin-malloc -fno-builtin-free -DMD_PROFILE_STAGE=${MD_PROFILE_STAGE:-0} -O2 -flto=thin -g -DNDEBUG -fno-emulated-tls -std=c++17 -pthread -fPIC -DMD_BENCH_BUILD_ID=\"$build_id\")
+common=(-DMD_TOUCH_TRACE="$touch_trace" -DMD_SLOW_TRACE="$slow_trace" -DSCUDO_SECONDARY_STATS="$secondary_stats" -fno-builtin-malloc -fno-builtin-free -DMD_PROFILE_STAGE=${MD_PROFILE_STAGE:-0} -O2 -flto=thin -g -DNDEBUG -fno-emulated-tls -std=c++17 -pthread -fPIC -DMD_BENCH_BUILD_ID=\"$build_id\")
 sources=(checksum common condition_variable_linux crc32_hw flags_parser flags
          fuchsia linux mem_map mem_map_fuchsia mem_map_linux release report report_linux
          shared_arena_linux scudo_delegation string_utils timing wrappers_c wrappers_cpp)
@@ -56,6 +62,9 @@ for name in delegation_backend kernel_bridge; do
   "$cxx" "${common[@]}" -I"$root" -c "$root/src/$name.cpp" -o "$work/objects/$name.o"
 done
 backend=("$work/objects/delegation_backend.o" "$work/objects/kernel_bridge.o")
+"$cxx" "${common[@]}" -I"$stage" -I"$root" \
+  "$root/tests/scudo_capacity_test.cpp" "${objects[@]}" "${backend[@]}" \
+  -static-libstdc++ -ldl -llog -landroid -latomic -o "$root/build/scudo_capacity_test.aarch64"
 "$cxx" "${common[@]}" -I"$root" "$root/tests/cpu_reader_test.cpp" \
   "${backend[@]}" -static-libstdc++ -ldl -latomic -o "$root/build/cpu_reader_test.aarch64"
 # Guard the allocator-runtime objects, not prebuilt libc++ exception helpers.
@@ -83,7 +92,7 @@ import hashlib,json,sys
 from pathlib import Path
 from datetime import datetime,timezone
 root=Path(sys.argv[1])
-data=dict(kernel_abi_version=3, broker_version=8, scudo_secondary_stats=__import__('os').environ.get('SCUDO_SECONDARY_STATS','0') == '1', protocol='shared_rings_v3',lto='thin',profile_stage=__import__('os').environ.get('MD_PROFILE_STAGE','0'),tls_model='native_elf',built_at=datetime.now(timezone.utc).isoformat(),
+data=dict(kernel_abi_version=3, broker_version=8, scudo_secondary_stats=__import__('os').environ.get('SCUDO_SECONDARY_STATS','0') == '1', protocol='shared_rings_v3',slow_trace=__import__('os').environ.get('MD_SLOW_TRACE','0') == '1',touch_trace=__import__('os').environ.get('MD_TOUCH_TRACE','0') == '1',lto='thin',profile_stage=__import__('os').environ.get('MD_PROFILE_STAGE','0'),tls_model='native_elf',built_at=datetime.now(timezone.utc).isoformat(),
           scudo_source=sys.argv[2],jemalloc_source=sys.argv[3],ndk=sys.argv[4],android_api=sys.argv[5],build_id=sys.argv[6])
 data['binaries']={name:hashlib.sha256((root/'build'/f'allocator_latency_{name}.aarch64').read_bytes()).hexdigest() for name in ['scudo','jemalloc']}
 (root/'build/allocator_latency_android_manifest.json').write_text(json.dumps(data,indent=2)+'\n')

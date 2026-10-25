@@ -11,7 +11,10 @@ extern "C" {
 typedef struct md_backend md_backend;
 
 // Payload capacity per CPU arena; metadata and guard pages are separate.
-#define MD_DEFAULT_ARENA_CAPACITY (512ULL << 20)
+// Four live 256 MiB Scudo objects need MORE than 1 GiB once headers and page
+// rounding are included. This reserves address space, not resident payload.
+// All clients and the broker must agree; change backing only after reboot.
+#define MD_DEFAULT_ARENA_CAPACITY (2ULL << 30)
 
 typedef struct {
   const char *domain;

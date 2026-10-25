@@ -27,6 +27,9 @@ for name in delegation_backend kernel_bridge; do
   "$cxx" "${common[@]}" -c "$root/src/$name.cpp" -o "$work/objects/$name.o"
   objects+=("$work/objects/$name.o")
 done
+"$cxx" "${common[@]}" -fno-builtin-malloc -fno-builtin-free \
+  "$root/tests/scudo_capacity_test.cpp" "${objects[@]}" -static -ldl \
+  -o "$root/build/scudo_capacity_test.linux.aarch64"
 "$cxx" "${common[@]}" -DMD_BENCH_SCUDO -DMD_BENCH_BUILD_ID=\"shared_rings_v3\" \
   "$root/tests/allocator_latency_bench.cpp" "${objects[@]}" -static -ldl \
   -o "$root/build/allocator_latency_scudo.linux.aarch64"

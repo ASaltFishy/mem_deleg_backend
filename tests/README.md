@@ -191,3 +191,128 @@ runner 的容量检查同步为512 MiB，jemalloc 的页面索引窗口从后端
 
 延迟 microbench 的 kernel 模式要求运行支持完整 512 MiB arena 的新内核；
 运行完整矩阵前，phone pretest 会先验证实际设备 ABI 和分配路径。
+
+### 四进程大块容量与严格路线验证（2026-10-24）
+
+当前默认已从上面的历史 512 MiB 配置调整为每 CPU Arena **2 GiB**，
+broker、Scudo、jemalloc 与内核外部 Backend 上限一致。256 MiB 的 Scudo
+请求含 Header/对齐实际需 268435600 字节，旧容量只够同时持有一个，
+因此原 256 MiB×2/4 进程矩阵可能返回 ENOMEM 后走 secondary。
+payload 仍按需分配，但内核页级元数据随容量增加。
+必须刷入支持 2 GiB 的内核并重启，再使用新 backing，不能在同启动中替换旧 backing。
+
+Ubuntu 上运行 `bash tests/run_phone_v3_tests.sh`：默认 128 KiB～256 MiB、
+1/2/4 进程、216 组，`ALLOW_FALLBACK=0`。预热或测量期间一旦发生 fallback
+即失败。通用 `run_v2_android.sh` 保留 `ALLOW_FALLBACK=1` 默认值，兼容
+包含 primary 分配的旧矩阵；测纯委托性能应显式传 0 或使用上述严格入口。
+
+新增 `scudo_capacity_test.cpp` 同时持有四个 128/256 MiB 块，读取后端失败
+错误码并验证释放后的 checkpoint。构建脚本分别产出 Android/Linux 测试程序；
+`RUN_CAPACITY=1` 启用 QEMU 容量回归，须先重建 Linux 二进制。
+用 `--expect-exhaustion` 可验证旧 512 MiB 构建确实返回 ENOMEM。
+
+### 慢样本与页表同步诊断（2026-10-25）
+
+benchmark 现在输出 `max`，power CSV 保留 `alloc_max`，summary 保留重复中的
+`max_ns`，旧日志没有 max 时留空。原有 p50/p95/p99 取样定义保持不变。
+
+`MD_SLOW_TRACE=1 bash tests/build_android_latency_bench.sh` 编译逐次时间诊断版。
+起止时间/PID 缓冲区预分配，所有 worker 完成后才输出 ALLOC_SAMPLE；
+alloc 区间不新增 syscall 或打印。诊断构建在 manifest 中标记 slow_trace=true，
+正式测时延前须重新使用默认 MD_SLOW_TRACE=0 构建。
+
+将诊断二进制命名为 `/data/local/tmp/md-slow-tail/allocator_latency_scudo.trace.aarch64`，
+并推送 `tests/phone/capture_alloc_tail.sh`，在 root 下运行该脚本可捕获 CPU0 的
+sched/IRQ 和可选 kprobe 轨迹。需有本次启动的 v8 broker socket。
+第一个参数为唯一 run 名，第二个参数 1 启用同步/撤销探针；REPEATS 控制重复数。
+结果目录位于 `/data/local/tmp/md-slow-tail/<run名>/`。可用 FREQ 设置当前 policy
+范围内的频率请求及 performance governor；Android 电源服务可能调整频率请求，
+因此不应把它描述为严格硬件锁频。脚本结束恢复原调频配置、删除自建探针与 instance。
+
+拉取结果后，运行 `python3 tests/analyze_alloc_tail.py <目录>` 可关联慢样本与
+离 CPU 时间；`python3 tests/analyze_pte_sync_trace.py <目录>` 统计测量窗口内
+同步次数、实际 zap 次数及扣除切出 CPU 后的同步墙钟耗时。后者仍包含 IRQ 和探针成本，
+不是纯用户态指令 CPU 时间；有 overrun、dropped events 或 missed return probes 时
+不能把不完整轨迹当完整归因。本轮数据上述丢失计数均为零。
+
+### 触页长尾诊断（2026-10-25）
+
+`MD_TOUCH_TRACE=1` 是默认关闭的诊断构建开关。它预分配逐次记录，在触页前后采集
+`RUSAGE_THREAD` 和线程 CPU 时间，输出 `TOUCH_SAMPLE` 的单调时钟区间、CPU 时间、
+minor/major fault 与上下文切换增量。`TOUCH_SAMPLE` 的 wall 区间只包围 touchPages；
+诊断构建原有 `hold_only` 会额外包含这些探针，不能当作正式时延结果。所有样本在
+worker 结束并 checkpoint 后输出，不在触页循环内打印。
+
+构建脚本支持并将此开关纳入 build ID/manifest：
+
+```sh
+MD_TOUCH_TRACE=1 MD_SLOW_TRACE=1 bash tests/build_android_latency_bench.sh
+```
+
+本次实际诊断单独链接了已有对象，产物位于
+`/home/lrc/patent/md-touch-diagnosis-20261025/allocator_latency_scudo.touch.aarch64`，
+没有覆盖正式 `build/` 中的 benchmark。
+
+将诊断二进制部署为 `/data/local/tmp/md-touch-bench.aarch64`，将
+`tests/phone/capture_touch_tail.sh` 推送为 `/data/local/tmp/md-capture-touch.sh`，然后运行：
+
+```sh
+adb shell su -c 'sh /data/local/tmp/md-capture-touch.sh touch_light light 268435456 4 10 3'
+```
+
+参数为唯一名称、模式、请求字节数、同 CPU0 worker 数、每 worker 次数和重复次数。
+模式 `none` 仅逐次计数；`light` 关联调度、IRQ、PTE 同步、zap、shmem 换入和回收；
+`fault` 额外对 handle_mm_fault 入/返回逐次记录，扰动明显，只用于确认调用路径和
+重试次数，不用于正式时延比较。每次 capture 使用独立 tracefs instance，只对该次
+worker PID 启用动态 probe，并在退出时移除自己的 probe/instance。
+
+可在启动 capture 时设置 `MD_TOUCH_MINCORE=1`，在触页前额外读取 file-backed 页的
+驻留状态。驻留位不能说明 PTE 已存在；该探测本身也会改变时序。未启用时
+`resident_pages=UINT64_MAX`，不能解释成实际驻留页数。探测缓冲使用独立匿名 mmap，
+避免通过被测委托分配器额外持有活块。
+
+脚本复用本次 boot_id 的常驻 v8 broker，不 reset backing、不停止 broker、不改频率。
+输出在 `/data/local/tmp/md-touch-diagnosis/<名称>/`。拉取目录后执行：
+
+```sh
+python3 tests/analyze_touch_tail.py /path/to/capture
+python3 tests/test_touch_trace.py
+python3 tests/test_touch_analysis.py
+```
+
+分析器校验 trace 丢失及 kprobe miss，关联调度切出区间、其他 worker 的 CPU 占用，
+按触页窗口和地址范围统计 fault/RETRY、PTE 同步和换入。返回值 RETRY 不计作第二个
+minor fault；嵌套阶段不应简单相加。常规文本 trace 的时间戳精度为微秒，单次 fault
+的亚微秒分位数不精确；重探针会明显放大总时延。
+
+
+### 墙钟对照流程调整（2026-10-25，尚未构建/运行验证）
+
+- 计时继续使用 steady_clock 墙钟。Scudo 预热实际全部为 Primary 时，跳过无关的测量前 backend checkpoint；若预热涉及 Secondary/委托则保留 checkpoint。测量结束仍保留原来的委托 checkpoint，覆盖初始化、样本缓冲区等其他后端活动的收尾。线程屏障汇总所有 worker 的需求，避免仅由最后到达者决定。无跳过 ownership 检查的委托快路径。
+- power 矩阵每轮交错三种配置，按六种排列轮换，ORDER_OFFSET=0..5 可重复改变起始顺序。每组仍启动全新进程；broker/domain 保留。
+- 新默认 WARMUP=10、ITERATIONS=30、REPETITIONS=5。power 的 16/32/64 KiB 使用至少 PRIMARY_WARMUP=1000 和 PRIMARY_ITERATIONS=10000；可用同名环境变量调整下限，实际次数记录在 POWER_CASE_BEGIN。大块不套用一万次下限。
+- summary.csv 新增每轮 p50/p95/p99 的中位数、每轮均值的中位数，并保留墙钟均值、跨轮标准差及最大单次值。它们不是合并样本后的分位数。新增 scudo_alloc_only_p50.png/pdf；原均值图保留。raw_results.csv 保存上下文切换和缺页计数，不自动剔除长尾。
+- 独立调度诊断入口 tests/phone/capture_alloc_sched.sh，要求 MD_SLOW_TRACE=1 构建的 benchmark，通过 BENCH 指定完整路径；VARIANT=cache|mmap|delegated、SIZE、WORKERS、ITERATIONS、WARMUP 可选。以 root 在手机执行，保存 sched/IRQ 与可用 mmap/munmap syscall 事件、逐次 ALLOC_SAMPLE、trace buffer stats；输出仅作诊断，不混入正式曲线。不自动改频率，不重启或清理 backing。
+- 本次只修改源码，未构建、未运行单测/计划预演或设备测试。下一次运行前必须重建 Android benchmark；--build-info 应含 prepare_policy=primary_checkpoint_skip_v1，诊断程序还必须含 slow_trace=1。
+
+
+### 采样缓冲区与停止日志诊断（2026-10-25）
+
+真机只读现场：CPU 1 normal 日志 head=32/tail=48、state=STOPPED，首条 normal_error=-ESTALE(116)，记录为 ALLOC/session=210/allocation_id=17/start=0/nr_pages=20。再次注册时因日志已停止返回 EINVAL(22)，旧适配器曾将初始化错误覆盖为 ENODEV(19)。未重置或恢复该日志。
+
+提高到 10000 次采样后，每个 u64 采样数组为 80000 字节，原 std::vector 会进入被测 Secondary/委托分配器。worker 数组在 post checkpoint 后析构，父进程的汇总和排序副本也会分配委托块；它们没有覆盖整个生命周期的 checkpoint，存在进程退出后残留过期 session 记录的漏洞。已改为 mmap/munmap 的独立 SampleStorage，覆盖采样、IPC 接收、父进程汇总和分位数排序副本。计时仍为墙钟，样本页仍在测量前初始化，不把统计内存分配计入被测路径。
+
+md_scudo_checkpoint 在后端从未初始化时直接返回成功，不为纯 Primary 工作负载主动注册全部 Arena；已初始化或初始化失败的后端仍执行 checkpoint 或保留真实错误。原始初始化 errno 和 pre/post phase 诊断继续保留。
+
+该改动仅构建通过，未运行真机 benchmark/回归，未修改内核。它隔离测试框架的无关分配，不代表内核退出会话与待处理日志的通用生命周期问题已通过验证。现有 STOPPED 日志不能通过换测试目录/重建用户态恢复；下次真实委托测试前需要用户手动重启手机，继续使用当前内核并由脚本按新 boot ID 部署。不要手工清零内核仍持有的 ring/backing。
+
+
+### 四类时延图（2026-10-25）
+
+power 入口和 quick/full 入口现在都在成功结束后自动生成 malloc、free、hold、all 四类折线图。每类提供均值/跨轮标准差带和每轮 p50 中位数两个版本，分别保存 PNG/PDF。jemalloc 按 mode、touch、cores、workers_per_core 分面，避免混合工作负载。p50 是每轮分位数的中位数，不是合并原始样本的分位数。
+
+文件名为 allocator_malloc、allocator_free、allocator_hold、allocator_all，p50 版本追加 _p50。Scudo 保留原 scudo_alloc_only 文件名作为兼容副本。Scudo 原 summary.csv 仍为 malloc 汇总，四指标汇总另存 summary_all_metrics.csv；quick/full 的 summary.csv 包含 metric 列与四类指标。两种入口的原始 CSV 均保留上下文切换统计。
+
+hold 为原 benchmark 的 touch/use 与辅助检查区间；all 为 malloc+hold+free 的墙钟测量区间，排除预热与 checkpoint。脚本只重新读取日志和绘图，无需重建二进制或重跑设备测试。
+
+旧 quick/full 数据可用 python3 tests/summarize_v2_latency.py --log RESULTS/run.log --output-dir RESULTS 补画。旧 Scudo power 数据可用 python3 tests/plot_scudo_power.py --log RESULTS/run.log --output-dir RESULTS 补画。

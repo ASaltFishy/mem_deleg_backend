@@ -1,0 +1,21 @@
+{
+  "kernel_abi_version": 3,
+  "broker_version": 8,
+  "scudo_secondary_stats": false,
+  "protocol": "shared_rings_v3",
+  "slow_trace": false,
+  "touch_trace": false,
+  "lto": "thin",
+  "profile_stage": "0",
+  "tls_model": "native_elf",
+  "built_at": "2026-10-25T12:21:57.070216+00:00",
+  "scudo_source": "/home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone",
+  "jemalloc_source": "/tmp/md-latency-jemalloc-android",
+  "ndk": "/home/lrc/patent/kernel/kernel_platform/prebuilts/ndk-r26",
+  "android_api": "34",
+  "build_id": "eba81924d00af6ca49c8",
+  "binaries": {
+    "scudo": "5de04590a3bc22480daade2f3de57638deadabf291649800732a53a9002af737",
+    "jemalloc": "1367c08650aef511809e7e958fbd1466f6f94e49106b5416060a8998ebae8981"
+  }
+}
