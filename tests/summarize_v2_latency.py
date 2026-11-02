@@ -30,6 +30,15 @@ def parse(text):
             if current is None or int(line.split('index=')[1]) != int(current['index']):
                 raise ValueError('Mismatched case PASS index')
             current['case_pass'] = 1
+        elif current is not None and line.startswith('bench_routes: '):
+            current.update({'route_' + key: int(value) for key, value in
+                            re.findall(r'\b(primary|delegated|secondary|fallback|samples)=(\d+)', line)})
+            if sum(current['route_' + key] for key in ('primary', 'delegated', 'secondary')) != current['route_samples']:
+                raise ValueError('Scudo route counts do not match samples')
+            # Primary is a distinct route, not a failed delegation attempt.
+            expected_fallback = current['route_secondary'] if current['path'] == 'delegated' else 0
+            if current['route_fallback'] != expected_fallback:
+                raise ValueError('Scudo fallback count does not match actual routes')
         elif current is not None and line.startswith('bench_jemalloc_routes: '):
             current.update({'route_' + key: int(value) for key, value in
                             re.findall(r'\b(delegated|ordinary|fallback|samples)=(\d+)', line)})

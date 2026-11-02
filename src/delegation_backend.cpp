@@ -217,7 +217,7 @@ static int openSharedObject(const char *Name, int Flags, mode_t Mode) {
 }
 
 constexpr uint64_t kMagic = 0x4d4442454e443031ULL;
-constexpr uint32_t kVersion = 8;
+constexpr uint32_t kVersion = 9;
 constexpr size_t kKernelLogBytes = 1U << 20;
 constexpr size_t kMaxKernelPageSize = 65536;
 constexpr uint32_t kNoIndex = UINT32_MAX;
@@ -225,7 +225,7 @@ constexpr uint32_t kNoOwner = UINT32_MAX;
 constexpr uint32_t kMaxRuns = 8192;
 constexpr uint32_t kNumBins = 24;
 
-enum RunState : uint32_t { Unused, Free, Claiming, InUse, Pending, Quarantined };
+enum RunState : uint32_t { Unused, Free, Claiming, InUse, Pending, Quarantined, Reclaiming };
 
 // Every descriptor read/write is serialized by ArenaMutex. Relaxed atomics
 // retain the representation; publication to other allocators is the Mutex unlock.
@@ -246,6 +246,9 @@ struct alignas(64) RunDescriptor {
   uint64_t AllocationId;
   uint64_t KernelSession;
   uint64_t HolderSession;
+  uint64_t FreeSinceNs;
+  uint32_t BackingHot; // conservative: may contain resident or swapped payload
+
 };
 
 struct alignas(kMaxKernelPageSize) SharedMetadata {
@@ -267,6 +270,8 @@ struct alignas(kMaxKernelPageSize) SharedMetadata {
   uint32_t ArenaId;
   uint32_t ArenaCount;
   uint32_t BumpPage;
+  uint32_t ReclaimEnabled; // arena 0: broker-managed, shared notification
+  uint32_t ReclaimWake;
   uint32_t FreeHead;
   uint32_t PendingHead; // migrated normal FREE only; linked through Run.Next
   uint32_t BinHeads[kNumBins];
@@ -441,6 +446,8 @@ static void initializeRun(SharedMetadata *Metadata, uint32_t Index,
                           uint32_t StartPage, uint32_t Pages,
                           RunState StateValue) {
   RunDescriptor &Run = Metadata->Runs[Index];
+  Run.FreeSinceNs = 0;
+  Run.BackingHot = 0;
   Run.Owner = kNoOwner;
   Run.LastOwner = kNoOwner;
   Run.LastSession = 0;
@@ -485,12 +492,15 @@ static void mergeProvenance(RunDescriptor &Destination,
   }
 }
 
-static uint32_t mergeFreeRun(SharedMetadata *Metadata, uint32_t Index) {
+static uint32_t mergeFreeRun(SharedMetadata *Metadata, uint32_t Index, bool Force = false) {
   RunDescriptor *Run = &Metadata->Runs[Index];
   uint32_t Prev = Run->Prev;
   if (Prev != kNoIndex) {
     RunDescriptor &PrevRun = Metadata->Runs[Prev];
-    if (PrevRun.StartPage + PrevRun.Pages == Run->StartPage) {
+    if (PrevRun.StartPage + PrevRun.Pages == Run->StartPage &&
+        (Force || PrevRun.BackingHot == Run->BackingHot)) {
+      PrevRun.BackingHot |= Run->BackingHot;
+      if (Run->FreeSinceNs > PrevRun.FreeSinceNs) PrevRun.FreeSinceNs = Run->FreeSinceNs;
       mergeProvenance(PrevRun, *Run);
       unlinkBin(Metadata, Prev);
       unlinkBin(Metadata, Index);
@@ -507,7 +517,10 @@ static uint32_t mergeFreeRun(SharedMetadata *Metadata, uint32_t Index) {
   uint32_t Next = Run->Next;
   if (Next != kNoIndex) {
     RunDescriptor &NextRun = Metadata->Runs[Next];
-    if (Run->StartPage + Run->Pages == NextRun.StartPage) {
+    if (Run->StartPage + Run->Pages == NextRun.StartPage &&
+        (Force || Run->BackingHot == NextRun.BackingHot)) {
+      Run->BackingHot |= NextRun.BackingHot;
+      if (NextRun.FreeSinceNs > Run->FreeSinceNs) Run->FreeSinceNs = NextRun.FreeSinceNs;
       mergeProvenance(*Run, NextRun);
       unlinkBin(Metadata, Index);
       unlinkBin(Metadata, Next);
@@ -567,6 +580,8 @@ static __attribute__((noinline)) int claimRun(ArenaImpl *Backend, uint32_t Index
   uint32_t OriginalPages = Run.Pages;
   uint64_t LastSession = Run.LastSession;
   uint32_t LastOwner = Run.LastOwner;
+  uint32_t BackingHot = Run.BackingHot;
+  uint64_t FreeSinceNs = Run.FreeSinceNs;
   uint32_t PrefixPages = StartPage - OriginalStart;
   uint32_t SuffixStart = StartPage + NeededPages;
   uint32_t SuffixPages = OriginalStart + OriginalPages - SuffixStart;
@@ -592,12 +607,16 @@ static __attribute__((noinline)) int claimRun(ArenaImpl *Backend, uint32_t Index
     makeFree(Metadata, Prefix, OriginalStart, PrefixPages);
     Metadata->Runs[Prefix].LastSession = LastSession;
     Metadata->Runs[Prefix].LastOwner = LastOwner;
+    Metadata->Runs[Prefix].BackingHot = BackingHot;
+    Metadata->Runs[Prefix].FreeSinceNs = FreeSinceNs;
     MD_STAT(Metadata->SplitCount.incrementLocked());
   }
   if (Suffix != kNoIndex) {
     makeFree(Metadata, Suffix, SuffixStart, SuffixPages);
     Metadata->Runs[Suffix].LastSession = LastSession;
     Metadata->Runs[Suffix].LastOwner = LastOwner;
+    Metadata->Runs[Suffix].BackingHot = BackingHot;
+    Metadata->Runs[Suffix].FreeSinceNs = FreeSinceNs;
     MD_STAT(Metadata->SplitCount.incrementLocked());
   }
   Run.StartPage = StartPage;
@@ -716,6 +735,12 @@ static __attribute__((always_inline)) inline int refreshKernelBridgesAfterFork(
 static uint32_t publishLocked(SharedMetadata *Metadata, uint32_t Index) {
   RunDescriptor &Run = Metadata->Runs[Index];
   Run.Owner = kNoOwner;
+  Run.BackingHot = 1;
+  Run.FreeSinceNs = nowNs();
+  SharedMetadata *Root = Metadata - Metadata->ArenaId;
+  if (__atomic_load_n(&Root->ReclaimEnabled, __ATOMIC_RELAXED) &&
+      !__atomic_exchange_n(&Root->ReclaimWake, 1U, __ATOMIC_RELEASE))
+    syscall(SYS_futex, &Root->ReclaimWake, FUTEX_WAKE, 1, nullptr, nullptr, 0);
   Run.Generation.incrementLocked();
   Run.State.store(Free, __ATOMIC_RELAXED);
   Run.Prev = Run.Next = Run.BinPrev = Run.BinNext = kNoIndex;
@@ -1219,6 +1244,8 @@ static __attribute__((noinline)) int acquireLocal(md_arena_view *Backend, size_t
   md_test_metadata_locked();
 #endif
   MD_STAT(Metadata->AcquireCalls.incrementLocked());
+  bool Consolidated = false;
+RetryFreeBins:
   uint32_t StartClass = sizeClass(NeededPages);
   for (uint32_t Class = StartClass; Class < kNumBins; ++Class) {
     for (uint32_t Index = Metadata->BinHeads[Class]; Index != kNoIndex;
@@ -1246,6 +1273,16 @@ static __attribute__((noinline)) int acquireLocal(md_arena_view *Backend, size_t
       unlock(Metadata);
       return ENOSPC;
     }
+  }
+  // Hot/cold boundaries must not make contiguous free capacity unusable.
+  if (!Consolidated) {
+    uint32_t Index = Metadata->FreeHead;
+    while (Index != kNoIndex) {
+      Index = mergeFreeRun(Metadata, Index, true);
+      Index = Metadata->Runs[Index].Next;
+    }
+    Consolidated = true;
+    goto RetryFreeBins;
   }
   int Result = acquireBumpLocked(Impl, NeededPages, AlignmentPages, Owner, Out);
   MD_STOP(CandidateProbe);
@@ -1451,8 +1488,12 @@ static void statsLocal(md_arena_view *Backend, md_stats *Out) {
     uint32_t StateValue = Run.State.load(md_atomic::memory_order_relaxed);
     if (StateValue == InUse || StateValue == Claiming || StateValue == Pending || StateValue == Quarantined)
       Out->bytes_in_use += Bytes;
-    else if (StateValue == Free)
+    else if (StateValue == Free) {
       Out->bytes_free += Bytes;
+      if (Run.BackingHot) Out->bytes_free_hot += Bytes;
+      else Out->bytes_free_cold += Bytes;
+    } else if (StateValue == Reclaiming) Out->bytes_reclaiming += Bytes;
+    if (StateValue == Pending) Out->bytes_pending += Bytes;
   }
   unlock(Metadata);
 }
@@ -1611,6 +1652,7 @@ extern "C" void md_get_stats(md_backend *Backend, md_stats *Out) {
     SUM(acquire_calls); SUM(acquire_successes); SUM(release_calls);
     SUM(release_successes); SUM(split_count); SUM(merge_count);
     SUM(bytes_in_use); SUM(bytes_free); SUM(lock_acquisitions);
+    SUM(bytes_free_hot); SUM(bytes_free_cold); SUM(bytes_reclaiming); SUM(bytes_pending);
     SUM(lock_contentions); SUM(lock_wait_ns); SUM(remote_enqueued);
     SUM(remote_drained); SUM(rseq_successes); SUM(rseq_aborts);
     SUM(descriptor_pops); SUM(address_steps); SUM(hint_hits);
@@ -1633,4 +1675,138 @@ extern "C" int md_backend_broker_export(md_backend *Backend, int Fds[2]) {
   Fds[1] = fcntl(Backend->Impl.PayloadFd, F_DUPFD_CLOEXEC, 0);
   if (Fds[1] < 0) { int Error = errno; close(Fds[0]); Fds[0] = -1; return Error; }
   return 0;
+}
+
+extern "C" void md_backend_reclaim_notifications(md_backend *B, int Enabled) {
+  if (B) __atomic_store_n(&B->Impl.Metadata->ReclaimEnabled, !!Enabled, __ATOMIC_RELEASE);
+}
+extern "C" void md_backend_wait_reclaim(md_backend *B, unsigned TimeoutMs) {
+  if (!B) return;
+  uint32_t *Wake = &B->Impl.Metadata->ReclaimWake;
+  if (!__atomic_exchange_n(Wake, 0U, __ATOMIC_ACQ_REL)) {
+    timespec Timeout{static_cast<time_t>(TimeoutMs / 1000),
+                     static_cast<long>(TimeoutMs % 1000) * 1000000};
+    syscall(SYS_futex, Wake, FUTEX_WAIT, 0, &Timeout, nullptr, 0);
+    __atomic_exchange_n(Wake, 0U, __ATOMIC_ACQ_REL);
+  }
+}
+
+struct ReclaimCandidate {
+  uint64_t Since, Generation;
+  uint32_t Arena, Index;
+};
+static int compareReclaimCandidate(const void *A, const void *B) {
+  const auto *L = static_cast<const ReclaimCandidate *>(A);
+  const auto *R = static_cast<const ReclaimCandidate *>(B);
+  return L->Since < R->Since ? -1 : L->Since > R->Since;
+}
+
+extern "C" int md_backend_reclaim(md_backend *B, const md_reclaim_policy *Policy,
+                                  md_reclaim_result *Out) {
+  if (!B || !Policy || !Out || Policy->low_bytes > Policy->high_bytes ||
+      Policy->batch_bytes < B->Impl.PageSize || !Policy->max_runs) return EINVAL;
+  *Out = {};
+  cpu_set_t Saved;
+  if (sched_getaffinity(0, sizeof(Saved), &Saved)) return errno;
+  size_t Capacity = size_t(B->Impl.ArenaCount) * kMaxRuns;
+  auto *Candidates = static_cast<ReclaimCandidate *>(calloc(Capacity, sizeof(ReclaimCandidate)));
+  if (!Candidates) return ENOMEM;
+  size_t Count = 0;
+  auto SelectCpu = [&](unsigned Arena) {
+    if (B->Impl.ArenaCount == 1 && B->Impl.KernelDisabled) return true;
+    if (Arena >= CPU_SETSIZE || !CPU_ISSET(Arena, &Saved)) return false;
+    cpu_set_t One; CPU_ZERO(&One); CPU_SET(Arena, &One);
+    return sched_setaffinity(0, sizeof(One), &One) == 0;
+  };
+  for (unsigned Arena = 0; Arena < B->Impl.ArenaCount; ++Arena) {
+    if (!SelectCpu(Arena)) { ++Out->skipped; continue; }
+    SharedMetadata *M = B->Impl.Metadata + Arena;
+    // Never block behind a dead client holding the non-robust arena mutex.
+    if (pthread_mutex_trylock(&M->ArenaMutex)) { ++Out->skipped; continue; }
+    drainLocked(M);
+    if (!M->KernelError) {
+      for (uint32_t I = M->FreeHead; I != kNoIndex; I = M->Runs[I].Next) {
+        RunDescriptor &R = M->Runs[I];
+        uint64_t Bytes = uint64_t(R.Pages) * B->Impl.PageSize;
+        if (!R.BackingHot) { Out->bytes_cold += Bytes; continue; }
+        Out->bytes_hot += Bytes;
+        Candidates[Count++] = {R.FreeSinceNs, R.Generation.load(__ATOMIC_RELAXED), Arena, I};
+      }
+    } else { ++Out->failures; Out->last_error = M->KernelError; }
+    unlock(M);
+  }
+  qsort(Candidates, Count, sizeof(*Candidates), compareReclaimCandidate);
+  const uint64_t Now = nowNs();
+  const bool OverBudget = Out->bytes_hot > Policy->high_bytes;
+  uint64_t Remaining = Out->bytes_hot;
+  uint64_t AttemptedBytes = 0;
+  uint32_t Attempts = 0;
+  for (size_t C = 0; C < Count && Attempts < Policy->max_runs &&
+       AttemptedBytes + B->Impl.PageSize <= Policy->batch_bytes; ++C) {
+    const auto Candidate = Candidates[C];
+    bool Expired = Policy->idle_ns && Now >= Candidate.Since &&
+                   Now - Candidate.Since >= Policy->idle_ns;
+    if (!(OverBudget && Remaining > Policy->low_bytes) && !Expired) continue;
+    if (!SelectCpu(Candidate.Arena)) { ++Out->skipped; continue; }
+    auto View = arenaView(B, Candidate.Arena);
+    SharedMetadata *M = View.Impl.Metadata;
+    if (pthread_mutex_trylock(&M->ArenaMutex)) { ++Out->skipped; continue; }
+    RunDescriptor &R = M->Runs[Candidate.Index];
+    if (M->KernelError || R.State.load(__ATOMIC_RELAXED) != Free ||
+        R.Generation.load(__ATOMIC_RELAXED) != Candidate.Generation || !R.BackingHot) {
+      unlock(M); ++Out->skipped; continue;
+    }
+    uint64_t Limit = Policy->batch_bytes - AttemptedBytes;
+    if (!Expired && Remaining > Policy->low_bytes && Limit > Remaining - Policy->low_bytes)
+      Limit = Remaining - Policy->low_bytes;
+    uint32_t Pages = static_cast<uint32_t>(Limit / B->Impl.PageSize);
+    if (!Pages) { unlock(M); continue; }
+    if (Pages > R.Pages) Pages = R.Pages;
+    md_lease Reserved{};
+    int Error = claimRun(&View.Impl, Candidate.Index, R.StartPage, Pages, kNoOwner, &Reserved);
+    if (Error) { unlock(M); ++Out->skipped; continue; }
+    R.State.store(Reclaiming, __ATOMIC_RELAXED);
+    // The isolated range cannot be allocated or merged while head catches up.
+    md_shared_log *Log = sharedLog(M);
+    uint64_t Ticket = __atomic_load_n(&Log->normal.reserved, __ATOMIC_ACQUIRE);
+    unlock(M);
+    ++Attempts;
+    AttemptedBytes += Reserved.size;
+    if (M->KernelEnabled == 1) {
+      uint64_t Deadline = nowNs() + 20000000ULL;
+      while (__atomic_load_n(&Log->normal.head, __ATOMIC_ACQUIRE) < Ticket &&
+             __atomic_load_n(&Log->state, __ATOMIC_ACQUIRE) == MD_SHARED_LOG_RUNNING &&
+             nowNs() < Deadline) usleep(100);
+      if (__atomic_load_n(&Log->state, __ATOMIC_ACQUIRE) != MD_SHARED_LOG_RUNNING)
+        Error = ESHUTDOWN;
+      else if (__atomic_load_n(&Log->normal.head, __ATOMIC_ACQUIRE) < Ticket)
+        Error = EAGAIN;
+    }
+#ifdef MD_TEST_RECLAIM
+    extern int md_test_reclaim_hook(uintptr_t, size_t);
+    if (!Error) Error = md_test_reclaim_hook(Reserved.address, Reserved.size);
+#endif
+    if (!Error && madvise(reinterpret_cast<void *>(Reserved.address), Reserved.size, MADV_REMOVE))
+      Error = errno;
+    // Recovery must publish this descriptor exactly once. As elsewhere in the
+    // backend, death of a mutex owner is fail-closed, not automatically repaired.
+    lock(M);
+    R.BackingHot = Error ? 1 : 0;
+    R.Owner = kNoOwner;
+    R.Generation.incrementLocked();
+    R.State.store(Free, __ATOMIC_RELAXED);
+    linkAddress(M, Candidate.Index);
+    linkBin(M, Candidate.Index);
+    mergeFreeRun(M, Candidate.Index);
+    unlock(M);
+    if (Error) { ++Out->failures; Out->last_error = Error; }
+    else {
+      Out->bytes_reclaimed += Reserved.size;
+      ++Out->runs_reclaimed;
+      Remaining = Remaining > Reserved.size ? Remaining - Reserved.size : 0;
+    }
+  }
+  free(Candidates);
+  int Error = sched_setaffinity(0, sizeof(Saved), &Saved) ? errno : 0;
+  return Error;
 }

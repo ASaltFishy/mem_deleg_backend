@@ -6,8 +6,8 @@ adb_bin=${ADB_BIN:-adb}
 adb_args=()
 [[ -z "${ADB_SERIAL:-}" ]] || adb_args=(-s "$ADB_SERIAL")
 export ADB_SERVER_SOCKET=${ADB_SERVER_SOCKET:-tcp:127.0.0.1:15037}
-domain=${DOMAIN:-allocator_delegation_v8_c256m}
-phone_dir=${PHONE_DIR:-/data/local/tmp/md_backend_v8_c256m}
+domain=${DOMAIN:-allocator_delegation_v9_c256m}
+phone_dir=${PHONE_DIR:-/data/local/tmp/md_backend_v9_c256m}
 cpus=${CPUS:-0}; matrix=${MATRIX:-power}
 allocators=${ALLOCATORS:-scudo,jemalloc}
 case "$allocators" in scudo|jemalloc|scudo,jemalloc) ;; *) echo 'ALLOCATORS must be scudo, jemalloc or scudo,jemalloc' >&2; exit 2;; esac

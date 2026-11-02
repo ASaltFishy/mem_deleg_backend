@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <pthread.h>
+#include <time.h>
+#include <stdint.h>
 
 // Versioned, read-only query: no registration, mapping, or backing mutation.
 static int checkKernelAbi() {
@@ -30,11 +33,116 @@ static int checkKernelAbi() {
   return 1;
 }
 
+// One maintenance owner per domain. No worker in application allocators.
+struct Reclaimer {
+  md_backend *Backend;
+  md_reclaim_policy Policy;
+};
+static bool readOption(const char *Name, uint64_t Default, uint64_t *Out) {
+  const char *Value = getenv(Name);
+  if (!Value) { *Out = Default; return true; }
+  if (!*Value || *Value == '-') return false;
+  char *End; errno = 0;
+  unsigned long long Parsed = strtoull(Value, &End, 10);
+  if (errno || *End) return false;
+  *Out = Parsed; return true;
+}
+static uint64_t monotonicNs() {
+  timespec T; clock_gettime(CLOCK_MONOTONIC, &T);
+  return uint64_t(T.tv_sec) * 1000000000ULL + T.tv_nsec;
+}
+static unsigned memoryPressure(uint64_t *PreviousStall, uint64_t *PreviousTime) {
+  unsigned Level = 0;
+  FILE *File = fopen("/proc/meminfo", "r");
+  char Line[256]; unsigned long long Total = 0, Available = 0;
+  bool HaveAvailable = false;
+  if (File) {
+    while (fgets(Line, sizeof(Line), File)) {
+      if (sscanf(Line, "MemTotal: %llu kB", &Total) == 1) continue;
+      if (sscanf(Line, "MemAvailable: %llu kB", &Available) == 1) HaveAvailable = true;
+    }
+    fclose(File);
+    if (Total && HaveAvailable) {
+      if (Available < Total / 20) Level = 2;
+      else if (Available < Total / 10) Level = 1;
+    }
+  }
+  File = fopen("/proc/pressure/memory", "r");
+  unsigned long long Stall = 0; bool HaveStall = false;
+  if (File) {
+    while (fgets(Line, sizeof(Line), File)) {
+      char *Value = strstr(Line, "total=");
+      if (!strncmp(Line, "some ", 5) && Value && sscanf(Value, "total=%llu", &Stall) == 1)
+        HaveStall = true;
+    }
+    fclose(File);
+  }
+  uint64_t Now = monotonicNs();
+  if (HaveStall && *PreviousTime && Stall >= *PreviousStall && Now > *PreviousTime) {
+    double Fraction = double(Stall - *PreviousStall) * 1000.0 / double(Now - *PreviousTime);
+    if (Fraction >= 0.30) Level = 2;
+    else if (Fraction >= 0.10 && Level < 1) Level = 1;
+  }
+  if (HaveStall) { *PreviousTime = Now; *PreviousStall = Stall; }
+  return Level;
+}
+static void *reclaimWorker(void *Argument) {
+  auto *Worker = static_cast<Reclaimer *>(Argument);
+  uint64_t PreviousStall = 0, PreviousTime = 0, LastPressure = 0, LastReport = 0;
+  unsigned Level = 0;
+  bool Trimming = false, ContinueDrain = false;
+  for (;;) {
+    if (!ContinueDrain) md_backend_wait_reclaim(Worker->Backend, 200);
+    uint64_t Now = monotonicNs();
+    unsigned Observed = memoryPressure(&PreviousStall, &PreviousTime);
+    if (Observed >= Level) { Level = Observed; if (Observed) LastPressure = Now; }
+    else if (Now - LastPressure >= 5000000000ULL) { Level = Observed; LastPressure = Now; }
+    md_reclaim_policy Policy = Worker->Policy;
+    if (Level == 1) {
+      Policy.high_bytes /= 4; Policy.low_bytes /= 4;
+      if (!Policy.idle_ns || Policy.idle_ns > 200000000ULL) Policy.idle_ns = 200000000ULL;
+    } else if (Level == 2) { Policy.high_bytes = Policy.low_bytes = 0; }
+    if (Trimming) Policy.high_bytes = Policy.low_bytes;
+    md_reclaim_result Result{};
+    int Error = md_backend_reclaim(Worker->Backend, &Policy, &Result);
+    uint64_t Remaining = Result.bytes_hot > Result.bytes_reclaimed ?
+                         Result.bytes_hot - Result.bytes_reclaimed : 0;
+    Trimming = (Trimming || Result.bytes_hot > Policy.high_bytes) && Remaining > Policy.low_bytes;
+    if ((Error || Result.failures || Result.bytes_reclaimed) && Now - LastReport >= 1000000000ULL) {
+      fprintf(stderr, "RECLAIM pressure=%u hot_estimate=%llu cold=%llu released=%llu failures=%llu skipped=%llu error=%d\n",
+              Level, (unsigned long long)Result.bytes_hot, (unsigned long long)Result.bytes_cold,
+              (unsigned long long)Result.bytes_reclaimed, (unsigned long long)Result.failures,
+              (unsigned long long)Result.skipped, Error ? Error : Result.last_error);
+      LastReport = Now;
+    }
+    // A nonempty backlog must not be throttled to one batch per timer tick.
+    // Keep the configured per-call bounds, yield briefly between successful
+    // batches, and back off on contention/errors instead of busy spinning.
+    ContinueDrain = !Error && Result.bytes_reclaimed &&
+                    (Trimming || Result.bytes_reclaimed >= Policy.batch_bytes);
+    usleep(ContinueDrain ? 1000 : 50000);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--check-kernel")) return checkKernelAbi();
   if (argc != 3) { fprintf(stderr,"usage: %s SOCKET DOMAIN\n",argv[0]); return 2; }
   const char *Mode = getenv("MD_KERNEL_BRIDGE");
   if (Mode && !strcmp(Mode, "required") && checkKernelAbi()) return 1;
+  Reclaimer Worker{};
+  uint64_t IdleMs, BatchRuns;
+  if (!readOption("MD_RECLAIM_HIGH_BYTES", 128ULL << 20, &Worker.Policy.high_bytes) ||
+      !readOption("MD_RECLAIM_LOW_BYTES", 64ULL << 20, &Worker.Policy.low_bytes) ||
+      !readOption("MD_RECLAIM_IDLE_MS", 2000, &IdleMs) ||
+      !readOption("MD_RECLAIM_BATCH_BYTES", 16ULL << 20, &Worker.Policy.batch_bytes) ||
+      !readOption("MD_RECLAIM_MAX_RUNS", 8, &BatchRuns) ||
+      Worker.Policy.low_bytes > Worker.Policy.high_bytes ||
+      IdleMs > UINT64_MAX / 1000000 || !BatchRuns || BatchRuns > 1024 ||
+      Worker.Policy.batch_bytes < (uint64_t)sysconf(_SC_PAGESIZE)) {
+    fprintf(stderr, "Invalid MD_RECLAIM_* policy\n"); return 2;
+  }
+  Worker.Policy.idle_ns = IdleMs * 1000000;
+  Worker.Policy.max_runs = static_cast<uint32_t>(BatchRuns);
   sockaddr_un Address{}; Address.sun_family=AF_UNIX;
   if (strlen(argv[1]) >= sizeof(Address.sun_path)) return 2;
   strcpy(Address.sun_path,argv[1]);
@@ -46,6 +154,15 @@ int main(int argc, char **argv) {
   md_backend *Backend=nullptr;
   int Error=md_backend_broker_create(&Backend,&Config);
   if(Error) { fprintf(stderr,"broker create error=%d (%s)\n",Error,strerror(Error)); unlink(argv[1]); return 1; }
+  Worker.Backend = Backend;
+  const char *ReclaimMode = getenv("MD_RECLAIM");
+  if (!ReclaimMode || strcmp(ReclaimMode, "0")) {
+    md_backend_reclaim_notifications(Backend, 1);
+    pthread_t Thread;
+    Error = pthread_create(&Thread, nullptr, reclaimWorker, &Worker);
+    if (Error) { fprintf(stderr, "reclaimer startup: %s\n", strerror(Error)); return 1; }
+    pthread_detach(Thread);
+  }
   printf("BACKEND_BROKER_READY version=%u domain=%s\n",MD_BROKER_VERSION,argv[2]); fflush(stdout);
   for(;;) {
     int Client=accept4(Server,nullptr,nullptr,SOCK_CLOEXEC); if(Client<0) { if(errno==EINTR) continue; return 1; }

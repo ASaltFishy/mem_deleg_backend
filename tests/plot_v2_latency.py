@@ -82,7 +82,7 @@ def plot(summary, allocator, stage, output, statistic):
             if path == 'delegated':
                 for row in data:
                     if row['fallback_pct']:
-                        ax.annotate(f"F {row['fallback_pct']:.0f}%", (row['size'] / 1024, row[statistic]),
+                        ax.annotate(f"F {row['fallback_pct']:.3g}%", (row['size'] / 1024, row[statistic]),
                                     xytext=(0, 7), textcoords='offset points', ha='center', fontsize=7,
                                     color=color)
         ax.set_xscale('log', base=2)

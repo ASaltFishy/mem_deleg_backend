@@ -57,6 +57,7 @@ typedef struct {
   uint64_t merge_count;
   uint64_t bytes_in_use;
   uint64_t bytes_free;
+  uint64_t bytes_free_hot, bytes_free_cold, bytes_reclaiming, bytes_pending;
   uint64_t lock_acquisitions;
   uint64_t lock_contentions;
   uint64_t lock_wait_ns;
@@ -89,6 +90,20 @@ void md_backend_close(md_backend *backend);
 // reaps receipts under their Arena Mutex. No explicit kernel drain/reset.
 // Never call from the measured allocation fast path.
 int md_backend_checkpoint(md_backend *backend);
+// Broker maintenance. Budgets cover the WHOLE pool, not each arena.
+// bytes_hot is a conservative logical estimate, never an RSS measurement.
+typedef struct {
+  uint64_t high_bytes, low_bytes, idle_ns, batch_bytes;
+  uint32_t max_runs;
+} md_reclaim_policy;
+typedef struct {
+  uint64_t bytes_hot, bytes_cold, bytes_reclaimed;
+  uint64_t runs_reclaimed, skipped, failures;
+  int last_error;
+} md_reclaim_result;
+int md_backend_reclaim(md_backend *, const md_reclaim_policy *, md_reclaim_result *);
+void md_backend_reclaim_notifications(md_backend *, int enabled);
+void md_backend_wait_reclaim(md_backend *, unsigned timeout_ms);
 uint32_t md_process_id(void);
 
 int md_acquire(md_backend *backend, size_t size, size_t alignment,
