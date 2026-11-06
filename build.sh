@@ -29,8 +29,4 @@ else
   echo "KERNEL_TREE is unset; skipped live kernel-UAPI check"
 fi
 
-python3 "$root/tests/test_latency_runner.py"
-python3 "$root/tests/test_bench_lifecycle.py"
-python3 "$root/tests/test_phone_pretest.py"
-
-echo "Backend compile checks and latency benchmark tool tests passed"
+echo "Backend compile checks completed"

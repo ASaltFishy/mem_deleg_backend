@@ -190,14 +190,14 @@ else
           index=$((index+1))
           printf '\n[%03d/%03d] %s | %s KiB | %s | %s workers/CPU | touch=%s | %s | repeat %s/%s\n' \
             "$index" "$total" "$allocator" "$((size/1024))" "$mode" "$workers" "$touch" "$path" "$repetition" "$REPETITIONS"
-          echo "V2_PHONE_CASE index=$index total=$total allocator=$allocator size=$size mode=$mode touch=$touch workers_per_core=$workers path=$path repetition=$repetition"
+          echo "LATENCY_CASE index=$index total=$total allocator=$allocator size=$size mode=$mode touch=$touch workers_per_core=$workers path=$path repetition=$repetition"
           if [ "$PLAN_ONLY" != 1 ]; then
             if "$DIR/allocator_latency_$allocator.aarch64" --size "$size" --mode "$mode" --cpus "$CPUS" \
               --workers-per-core "$workers" --path "$path" --allow-fallback "$ALLOW_FALLBACK" --touch-pages "$touch" --iterations "$case_iterations" --warmup "$case_warmup"; then
-              echo "V2_PHONE_CASE_PASS index=$index"
+              echo "LATENCY_CASE_PASS index=$index"
             else
               error=$?
-              echo "V2_PHONE_CASE_FAIL index=$index exit=$error" >&2
+              echo "LATENCY_CASE_FAIL index=$index exit=$error" >&2
               exit "$error"
             fi
           fi
@@ -207,5 +207,5 @@ else
     done; done; done; done
   done
 fi
-if [ "$PLAN_ONLY" = 1 ]; then echo V2_PLAN_ONLY; else echo V2_PHONE_ALL_PASS; fi
+if [ "$PLAN_ONLY" = 1 ]; then echo LATENCY_PLAN_ONLY; else echo LATENCY_ALL_PASS; fi
 # Leave broker alive and backing intact.

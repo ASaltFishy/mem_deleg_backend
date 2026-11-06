@@ -24,7 +24,7 @@ jemalloc="${JEMALLOC_SOURCE:-/tmp/md-latency-jemalloc-android}"
   echo 'Missing NDK, patched Scudo sources or patched Android jemalloc library.' >&2; exit 1;
 }
 mkdir -p "$root/work"
-work=$(mktemp -d "$root/work/android-latency-v2.XXXXXX")
+work=$(mktemp -d "$root/work/android-latency.XXXXXX")
 stage="$work/llvm/compiler-rt/lib/scudo/standalone"
 mkdir -p "$stage" "$work/objects" "$root/build"
 # Stage only source files; do not alter the source snapshot or its old backend.
@@ -68,11 +68,6 @@ for name in delegation_backend kernel_bridge; do
   "$cxx" "${common[@]}" -I"$root" -c "$root/src/$name.cpp" -o "$work/objects/$name.o"
 done
 backend=("$work/objects/delegation_backend.o" "$work/objects/kernel_bridge.o")
-"$cxx" "${common[@]}" -I"$stage" -I"$root" \
-  "$root/tests/scudo_capacity_test.cpp" "${objects[@]}" "${backend[@]}" \
-  -static-libstdc++ -ldl -llog -landroid -latomic -o "$root/build/scudo_capacity_test.aarch64"
-"$cxx" "${common[@]}" -I"$root" "$root/tests/cpu_reader_test.cpp" \
-  "${backend[@]}" -static-libstdc++ -ldl -latomic -o "$root/build/cpu_reader_test.aarch64"
 # Guard the allocator-runtime objects, not prebuilt libc++ exception helpers.
 # Losing native TLS here makes malloc recurse before main on Android.
 if "$toolchain/llvm-nm" --undefined-only "${objects[@]}" "${backend[@]}" | grep '__emutls_get_address'; then

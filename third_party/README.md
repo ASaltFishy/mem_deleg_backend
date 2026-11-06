@@ -48,7 +48,6 @@ Restore and select the source for the existing benchmark build scripts:
 SCUDO_SOURCE="$(python3 third_party/prepare_scudo.py)"
 export SCUDO_SOURCE
 PERF_MINIMAL=1 bash tests/build_android_latency_bench.sh
-# Alternatively: bash tests/build_linux_latency_bench.sh
 ```
 
 The default destination is `work/scudo-source`. The helper refuses to overwrite

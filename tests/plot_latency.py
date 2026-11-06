@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot quick/full latency results without combining distinct workloads."""
+"""Plot allocator latency results without combining distinct workloads."""
 import argparse
 import csv
 import math

@@ -42,7 +42,7 @@ for value in "$iterations" "$warmup" "$repetitions"; do [[ "$value" =~ ^[1-9][0-
 [[ "$domain" =~ ^[A-Za-z0-9_-]+$ && "$phone_dir" =~ ^/[A-Za-z0-9_/-]+$ && "$cpus" =~ ^[0-9]+(,[0-9]+)*$ ]]
 if [[ "$matrix" == power && "$cpus" == *,* ]]; then echo 'power requires a single CPU ID' >&2; exit 2; fi
 if [[ "${1:-}" == --dry-run ]]; then
-  exec sh "$root/tests/phone/run_v2_latency.sh" /unused "$domain" /unused.sock "$cpus" "$matrix" "$iterations" "$warmup" "$repetitions" 1 "$min_exp" "$max_exp" "$allow_fallback" "$primary_iterations" "$primary_warmup" "$order_offset" "$allocators" "$size_sweep" "$thread_counts" "$perf_minimal" "$process_counts"
+  exec sh "$root/tests/phone/run_latency_matrix.sh" /unused "$domain" /unused.sock "$cpus" "$matrix" "$iterations" "$warmup" "$repetitions" 1 "$min_exp" "$max_exp" "$allow_fallback" "$primary_iterations" "$primary_warmup" "$order_offset" "$allocators" "$size_sweep" "$thread_counts" "$perf_minimal" "$process_counts"
 fi
 [[ $# == 0 ]] || { echo 'Only --dry-run is supported; configure via environment.' >&2; exit 2; }
 results_dir=${RESULTS_DIR:-$root/work/scudo-power-$(date +%Y%m%d-%H%M%S)}
@@ -80,7 +80,7 @@ else
   deploy_dir=$bin_dir
 fi
 for name in "${names[@]}"; do "$adb_bin" "${adb_args[@]}" push "$root/build/$name" "$deploy_dir/$name"; done
-"$adb_bin" "${adb_args[@]}" push "$root/tests/phone/run_v2_latency.sh" "$deploy_dir/run_v2_latency.sh"
+"$adb_bin" "${adb_args[@]}" push "$root/tests/phone/run_latency_matrix.sh" "$deploy_dir/run_latency_matrix.sh"
 if [[ "${USE_SU:-0}" == 1 ]]; then
   "$adb_bin" "${adb_args[@]}" shell su -c "mkdir -p '$bin_dir'"
   "$adb_bin" "${adb_args[@]}" shell su -c "cp -R '$upload_dir/.' '$bin_dir/'"
@@ -90,16 +90,16 @@ if [[ "${USE_SU:-0}" == 1 ]]; then
 else
   "$adb_bin" "${adb_args[@]}" shell chmod 755 "$bin_dir/"'*'
 fi
-args="$bin_dir/run_v2_latency.sh $bin_dir $domain $phone_dir/backend.sock $cpus $matrix $iterations $warmup $repetitions 0 $min_exp $max_exp $allow_fallback $primary_iterations $primary_warmup $order_offset $allocators $size_sweep $thread_counts $perf_minimal $process_counts"
+args="$bin_dir/run_latency_matrix.sh $bin_dir $domain $phone_dir/backend.sock $cpus $matrix $iterations $warmup $repetitions 0 $min_exp $max_exp $allow_fallback $primary_iterations $primary_warmup $order_offset $allocators $size_sweep $thread_counts $perf_minimal $process_counts"
 if [[ "${USE_SU:-0}" == 1 ]]; then
   "$adb_bin" "${adb_args[@]}" shell su -c "sh $args" 2>&1 | tee "$log"
 else
   "$adb_bin" "${adb_args[@]}" shell "sh $args" 2>&1 | tee "$log"
 fi
-grep -q V2_PHONE_ALL_PASS "$log"
+grep -q LATENCY_ALL_PASS "$log"
 if [[ "$matrix" == power ]]; then
   python3 "$root/tests/plot_scudo_power.py" --log "$log" --output-dir "$results_dir"
 else
-  python3 "$root/tests/summarize_v2_latency.py" --log "$log" --output-dir "$results_dir"
+  python3 "$root/tests/summarize_latency.py" --log "$log" --output-dir "$results_dir"
 fi
 echo "Completed. Results: $results_dir"

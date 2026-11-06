@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Save quick/full case metrics and worker measurement-loop switch counters."""
+"""Summarize allocator latency matrices and worker measurement-loop switch counters."""
 import argparse
 import csv
 import re
@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 def parse(text):
+    # Accept historical version-prefixed logs without rewriting saved results.
+    text = re.sub(r"^V2_PHONE_", "LATENCY_", text, flags=re.MULTILINE)
     rows, current = [], None
 
     def finish():
@@ -21,12 +23,12 @@ def parse(text):
         rows.append(current.copy())
 
     for line in text.splitlines():
-        if line.startswith('V2_PHONE_CASE '):
+        if line.startswith('LATENCY_CASE '):
             finish()
             current = dict(re.findall(r'(\w+)=(\S+)', line))
-        elif line.startswith('V2_PHONE_CASE_FAIL '):
+        elif line.startswith('LATENCY_CASE_FAIL '):
             raise ValueError(line)
-        elif line.startswith('V2_PHONE_CASE_PASS '):
+        elif line.startswith('LATENCY_CASE_PASS '):
             if current is None or int(line.split('index=')[1]) != int(current['index']):
                 raise ValueError('Mismatched case PASS index')
             current['case_pass'] = 1
@@ -66,7 +68,7 @@ def parse(text):
                 current.update({match[1] + '_' + key + '_ns': float(value)
                                 for key, value in re.findall(r'(mean|p50|p95|p99|max)=([0-9.eE+-]+)', line)})
     finish()
-    if not rows or 'V2_PHONE_ALL_PASS' not in text:
+    if not rows or 'LATENCY_ALL_PASS' not in text:
         raise ValueError('No complete successful sweep')
     if 'total' in rows[0]:
         if len(rows) != int(rows[0]['total']) or [int(row['index']) for row in rows] != list(range(1, len(rows)+1)):
@@ -88,7 +90,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     print('Data:', destination)
-    from plot_v2_latency import generate
+    from plot_latency import generate
     generate(rows, args.output_dir)
 
 

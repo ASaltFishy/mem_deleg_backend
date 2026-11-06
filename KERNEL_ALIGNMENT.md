@@ -1,7 +1,10 @@
 # 内核 / Backend / Scudo 对接记录（2026-10-22）
 
-最终规范是内核根目录 DESIGN.md §2.10、§2.11 及最新性能修订 §2.12。
-以下描述当前实现；原 per-mm ABI 的历史通过结果不算新协议验收。
+> 本文保留 2026-10-22～24 的历史对接记录。下文的“当前”、版本号、测试入口和验收描述
+> 均指当时状态，不适用于现在的工作区。当前为内核 ABI v3、metadata/broker v9；
+> 构建与运行请使用 README.md，最终设计见
+> `/home/lrc/patent/kernel/kernel_platform/common/DESIGN.md`。
+> 原 §2.x 章节号也属于旧文档结构，不作为当前章节引用。
 
 ## 共享状态与协议
 
@@ -46,7 +49,7 @@ QEMU 用实际新内核，常驻 memfd broker + 独立进程 FD attach，测试�
 当前入口按用户要求默认快速矩阵：128 KiB、双核 thread、触页、两种路径，预热 5 次、测量 10 次、每组重复 2 次；`MATRIX=full` 扩大矩阵。委托路由和前后 checkpoint 必须通过，不能用减小计数绕过校验。
 
 QEMU 时延只用于暴露挂死/崩溃及完整链路成本，不代表手机性能。没有刷机、重启手机、替换设备分配器；没有宣称所有远端运行上下文的 PTE/TLB 隔离或恶意发布者安全性已经解决。
-新的 `tests/run_v2_android.sh` 与 `tests/phone/run_v2_latency.sh` 使用常驻域，不 reset/unlink/重启/刷机；当前只做语法检查，尚未实机执行。旧 Android runner 的 fresh-domain/清理流程不作为新入口。
+新的 `tests/run_android_latency.sh` 与 `tests/phone/run_latency_matrix.sh` 使用常驻域，不 reset/unlink/重启/刷机；当前只做语法检查，尚未实机执行。旧 Android runner 的 fresh-domain/清理流程不作为新入口。
 
 
 ## 2026-10-22 性能实验更新

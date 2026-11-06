@@ -14,4 +14,4 @@ export WARMUP=${WARMUP:-10} ITERATIONS=${ITERATIONS:-30} REPETITIONS=${REPETITIO
 echo "ABI v3 / broker v9; per-boot phone directory: $PHONE_DIR"
 echo "Range: 2^$MIN_EXP .. 2^$MAX_EXP KiB; allow_fallback=$ALLOW_FALLBACK"
 cd "$root"
-exec bash tests/run_v2_android.sh
+exec bash tests/run_android_latency.sh

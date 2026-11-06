@@ -1,80 +1,134 @@
-# Unified memory-delegation backend
+# 内存委托后端与分配器时延 microbench
 
-Current development after `md-milestone-20261025` uses **256 MiB per CPU Arena**
-and capacity-driven native fallback. The tag retains the earlier 2 GiB research
-snapshot and its phone evidence. See `tests/README.md` for `PERF_MINIMAL=1`,
-progress output, actual route counts and the required fresh-boot transition.
+本仓库提供 Scudo / jemalloc 共用的内存委托后端，以及 Android 真机分配器时延实验。
+代码位于 `lrc-ubuntu:/home/lrc/patent/memory-delegation-backend`。
+当前配置为每 CPU Arena 256 MiB、内核共享日志 ABI v3、metadata/broker v9。
+设计以 `/home/lrc/patent/kernel/kernel_platform/common/DESIGN.md` 为准。
 
+## 1. 准备环境
 
-最终设计以 `/home/lrc/patent/kernel/kernel_platform/common/DESIGN.md` 为准。
-本次实现共享元数据版本 7、内核双 ring ABI v2；旧版域必须停用，使用新域。
+以下命令均在 Ubuntu 服务器执行：
 
-- 每 Arena 一对共享日志，所有参与进程共用；正常更新使用 PTHREAD_PROCESS_SHARED Mutex。
-- 普通 Mutex 持有者允许迁核。同核 FREE 发布日志后立即入池；已迁出 owner CPU 的普通 FREE 和跨核 FREE 等成功回执后入池。
-- 远端释放只用已有租约原子投递，不拿 Arena Mutex、不改描述符。owner CPU 用户态在 Mutex 下核对并回收。
-- 普通 ALLOC 异步发布；无逐次显式 DRAIN、无 append ProducerLock。槽位同时保留记录和逐条结果，用户态回收后才能复用。
-- Android 应用必须 attach 常驻 `memory_delegation_backend_broker`，经 SCM_RIGHTS 获取 memfd；应用不创建 backing、不临时 fork broker。
-- 异常退出保守停滞/隔离，不自动恢复；恶意发布者认证留待后续。既有 ownership 与 PTE 检查保留。
-
-主机与 UAPI 检查：
-
-```sh
-KERNEL_TREE=/home/lrc/patent/kernel/kernel_platform/common ./build.sh
+```bash
+ssh lrc-ubuntu
+cd /home/lrc/patent/memory-delegation-backend
 ```
 
-构建和运行 Linux AArch64/QEMU 快速正确性验证：
+需要 Bash、Python 3、matplotlib、ADB，以及支持当前委托协议的 Android 手机和 `su` 权限。
+ADB 转发应已建立，入口默认使用：
 
-```sh
-bash tests/build_linux_latency_bench.sh
-KERNEL_IMAGE=/home/lrc/patent/md-v2-work/dist/Image bash tests/run_v2_qemu.sh
+```bash
+export ADB_SERVER_SOCKET=tcp:127.0.0.1:15037
+export ADB_SERIAL=3B15AL00K5D00000
 ```
 
-Scudo 编译使用实际 LLVM 工作树和 `adapters/scudo_delegation.*`。
-QEMU 启动常驻 memfd broker，运行 Backend 正确性测试；latency 默认 128 KiB、双核 thread、触页、traditional/delegated，预热 5 次、测量 10 次、每组重复 2 次（Scudo 共 4 次进程运行）。
-`RUN_JEMALLOC=1` 同时验证 jemalloc（共 8 次运行）；`MATRIX=full` 恢复完整矩阵，计数也可用 `WARMUP/ITERATIONS/REPETITIONS` 覆盖。
-委托组逐次核对实际路径，失败或回退不能当成通过。QEMU 时延不代表真机性能。
+可按实际连接覆盖这两个变量。入口自动读取 boot ID，使用
+`/data/local/tmp/md_backend_v9_c256m_<boot_id>` 和域 `allocator_delegation_v9_c256m`。
+已有兼容 broker 时复用，否则启动 broker；测试结束不销毁常驻共享池。
+脚本不刷机、不重启，也不重置活跃 backing。旧版本或不兼容容量的 Arena
+必须按设计完成停止/注销，或通过重启清除旧注册后再使用新 backing。
 
-Android 构建（不连接、重启或刷写设备）：
+## 2. 构建 Android 程序
 
-```sh
-bash tests/build_android_latency_bench.sh
+```bash
+PERF_MINIMAL=1 bash tests/build_android_latency_bench.sh
 ```
 
-产物在 `build/`：Scudo/jemalloc benchmark 与 broker。Android 运行前先在匹配新内核的环境中启动常驻服务：
+| 配置变量 | 默认位置或值 |
+| --- | --- |
+| `ANDROID_NDK_ROOT` | `/home/lrc/patent/kernel/kernel_platform/prebuilts/ndk-r26` |
+| `ANDROID_API` | `34` |
+| `SCUDO_SOURCE` | `/home/lrc/patent/llvm-20/compiler-rt/lib/scudo/standalone` |
+| `JEMALLOC_SOURCE` | `/tmp/md-latency-jemalloc-android` |
 
-```sh
-MD_KERNEL_BRIDGE=required build/memory_delegation_backend_broker.aarch64 \
-  /data/local/tmp/md-backend.sock allocator_delegation
+Scudo 必须包含委托补丁；jemalloc 必须已生成 `lib/libjemalloc.a`。
+第三方源码包、补丁和恢复方法见 [third_party/README.md](third_party/README.md)。
+`/tmp` 下的库不是永久归档，丢失后需按该说明重建。
+
+构建生成：
+
+- `build/allocator_latency_scudo.aarch64`
+- `build/allocator_latency_jemalloc.aarch64`
+- `build/memory_delegation_backend_broker.aarch64`
+- `build/allocator_latency_android_manifest.json`
+
+构建不连接手机。运行脚本部署已有产物，不自动编译；修改源码后应先重建。
+构建和运行的 `PERF_MINIMAL` 必须一致。性能构建关闭额外计时探针及部分统计，
+保留实际分配路线计数和协议检查；不用于要求完整分配器内存统计的业务测量。
+
+## 3. 运行当前实验
+
+```bash
+PERF_MINIMAL=1 ALLOCATORS=scudo,jemalloc MATRIX=processes SIZE_SWEEP=power \
+PROCESS_COUNTS=1,2,4,8 MIN_EXP=4 MAX_EXP=19 \
+ALLOW_FALLBACK=1 CPUS=0 \
+WARMUP=1 ITERATIONS=30 REPETITIONS=5 \
+PRIMARY_WARMUP=1000 PRIMARY_ITERATIONS=10000 \
+bash tests/run_phone_latency.sh
 ```
 
-客户端配置相同 `MD_BROKER_SOCKET`、`MEMORY_DELEGATION_DOMAIN`，并设置
-`MD_KERNEL_BRIDGE=required SCUDO_DELEGATION_BACKEND=1 SCUDO_SHARED_ARENA_DISABLE=1`。
-每个 broker 当前服务一个固定配置的域；不允许仍有参与者时删除/重置 backing。
-新的手机入口为 `USE_SU=1 CPUS=0 bash tests/run_v2_android.sh`。默认仅 Scudo、独立进程同核竞争（1/2/4 个进程），大小从 2^4 KiB 到 2^18 KiB，逐幂递增；每组 5 次预热、10 次正式测量、重复 2 次。
-三条配置曲线为普通 Secondary cache 开启、普通 Secondary cache 关闭、统一委托开启（容量不足允许普通回退）。小块保持真实 Primary 行为，不人为强制进入 Secondary；每次测量输出实际 Primary/委托/普通 Secondary 数量、缓存命中和回退数量。
-默认共 270 次 benchmark 运行，输出进度中的幂次、KiB、同核进程数、配置、重复次数。结束后自动生成 `scudo_alloc_only.png/.pdf`、`raw_results.csv` 和 `summary.csv`，默认目录为 `work/scudo-power-时间戳/`，原始输出为 `run.log`。`RESULTS_DIR` 可指定目录。
-`bash tests/run_v2_android.sh --dry-run` 只打印计划，不连接设备。`MIN_EXP`/`MAX_EXP` 可缩小到 4..18 范围内的子区间；`MATRIX=quick` 或 `full` 仍可切回此前通用矩阵。
-Android 二进制已重建并在一加 15 上完成手机矩阵验证；测试脚本本身不刷机或重启。
-旧 Android runner 的每次 fresh-domain/删 backing 生命周期不能直接用于这个常驻域；不要直接复用旧命令声称验证。
+这是当前完整实验命令，不能仅运行入口脚本而省略参数：脚本自身的默认矩阵为 `power`，
+与这里的双分配器 `processes` 矩阵不同。
 
-实现/生命周期与验证范围详见 `KERNEL_ALIGNMENT.md`。第二适配器在
-`src/jemalloc_adapter.cpp`；Scudo standalone 的旧 SharedArena 路径仍可单独使用，但不能与统一后端混用。
+上述配置共 **1280 组**：2 个分配器 × 16 档大小 × 4 档进程数 × 2 条路径 × 5 次重复。
+请求大小为 16 KiB～512 MiB，worker 固定在 CPU0；每组触页，比较 traditional/delegated。
+1/2/4/8 指 worker 进程数，不包含控制进程与 broker。16/32/64 KiB 使用至少
+1000 次预热和 10000 次测量，其余大小使用 1 次预热、30 次测量。
 
+`ALLOW_FALLBACK=1` 保留容量不足时的原生分配路径；delegated 配置不表示每次分配
+都经过委托池。小块 Primary 与实际 fallback 均按日志记录，不能当成纯委托时延。
 
-## 2026-10-22 性能实验更新
+如只需查看计划，将命令最后一行替换为：
 
-最终设计以内核 DESIGN.md §2.12 为准。同核普通 FREE 发布日志后、确认仍在 owner CPU，即可直接发布空闲候选；远端及已经迁核的 FREE 等回执。获取者在 Mutex 后重查 CPU，持锁迁核本身仍允许。
-跨进程/跨 session/混合来源的自动整块清零已删除；MD_EAGER_CLEAR 自动策略已删除。显式 calloc、MD_ZERO 和调用方明确要求的清零保留语义。仍保留所有权、代际、日志与页表协议，未关闭内核桥接。
-共享 metadata/broker 协议为 v8，默认域 allocator_delegation_v8、目录 md_backend_v8；内核 ABI 为 v3。必须使用匹配的新内核，不能复用当前启动的 v7 backing。普通成功日志由内核直接回收，远端回执仍由用户态确认。
+```bash
+bash tests/run_android_latency.sh --dry-run
+```
 
-切换域前必须停止旧参与者并注销旧 Arena；当前没有用户态注销入口时须重启清除旧注册，否则内核会返回 EXDEV。手机本轮已重启清理，v7 broker 已运行，可直接重跑完整矩阵。
+其余环境参数保持相同。这个入口只打印计划，不连接手机；不要向外层
+`run_phone_latency.sh` 传 `--dry-run`，外层仍会读取设备 boot ID，且不转发参数。
 
+## 4. 查看结果与重新绘图
 
-## CPU 查询与热路径优化（2026-10-22）
+默认结果目录为 `work/scudo-power-时间戳/`，名称沿用历史约定，双分配器结果也放在这里。
+运行时可设置 `RESULTS_DIR` 指定新的目录；不要指向保留的论文数据目录。
 
-最终设计见内核 DESIGN.md §2.13。Android 内核启用 rseq 后，每线程注册一次，热路径读取内核维护的 TLS CPU ID；不固定核号、不绑单核。注册失败会回退系统调用。每个 benchmark 输出 rseq_workers / fallback_cpu_workers；MD_CPU_QUERY=syscall 可用于对照。
-Android 构建统一使用 ThinLTO（普通 Scudo 与委托路径相同参数）。本次还精简了操作局部视图、重复参数/启用检查、页数计算和 Mutex 内描述符内存序；共享 metadata v7 与内核 ring ABI v2 不变。
+成功运行后保存 `run.log`、`raw_results.csv`、`summary.csv`，并生成 Scudo/jemalloc 的
+malloc、free、hold、all 四类 PNG/PDF 图及各自的 `_p50` 版本。
+均值图默认显示跨轮标准差带；p50 为每轮 p50 的中位数，不是合并样本分位数。
+hold 包含触页及测量框架辅助检查，all 为 malloc+hold+free，不包含预热和 checkpoint。
 
-一加 15 当前内核 Build ID 为 886a06ac0115a469540d64e91bb3dbf25c5812f3；CPU 查询已通过真实迁核、fork、线程退出/TLS 复用测试。新内核启用 RSEQ 时必须同时使用配套 system_dlkm，不能只改 gki_defconfig 后忽略厂商 KABI。
+已有成功日志可单独汇总，无需重跑手机：
 
-当前协议细节见内核 DESIGN.md §2.17 与 tools/testing/memory_delegation/SHARED_LOG_V3.md。本次构建未部署到手机；新二进制不能在旧 v2 内核上运行。
+```bash
+python3 tests/summarize_latency.py \
+  --log /path/to/run.log \
+  --output-dir /path/to/new-plots
+```
+
+详细脚本职责和参数说明见 [tests/README.md](tests/README.md)。
+
+## 5. 论文数据与历史复现
+
+- 论文数据：`work/scudo-power-20261025-222327/`，保留原始日志、CSV 与最终 PNG/PDF。
+- 复现材料：`work/paper-reproduction-20261025-222327/`，包含历史源码、匹配的构建清单、
+  旧构建对象、绘图处理记录、文件校验值及单独的绘图副本。先阅读其中的 `README.txt`。
+
+论文数据的 build ID 为 `a8470476d331e565be41`，使用 **broker v8**；当前源码与程序
+使用 **broker v9**。运行当前代码不能直接宣称复现了旧版本数据。
+原始完整可执行文件和精确手机内核环境尚未在保留材料中确认，历史源码重建也未核对产物哈希。
+论文图曾去除均值阴影并更新 fallback 标注，需按复现目录说明处理；普通绘图入口的样式不同。
+
+## 目录用途
+
+| 目录 | 内容 |
+| --- | --- |
+| `src/`、`include/`、`adapters/` | 后端、协议及分配器适配源码 |
+| `tools/` | 常驻 broker 源码 |
+| `tests/` | 当前 microbench 的构建、运行与汇总绘图 |
+| `third_party/` | 可归档的第三方原始源码、补丁与来源记录 |
+| `build/` | 当前可部署的 benchmark、broker 与构建清单 |
+| `work/` | 论文数据、复现材料、恢复的 Scudo 源码，以及后续产生的临时构建和结果 |
+
+旧相机、QEMU、独立回归与诊断入口已清理，旧结果目录亦已删除；Git 历史和标签保留。
+`build.sh` 只用于本机后端编译及可选 UAPI 检查，不构建 Android benchmark。
+本文按现有脚本整理，未因此执行构建、计划预演或设备测试。
